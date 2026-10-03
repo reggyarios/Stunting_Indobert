@@ -1,0 +1,6 @@
+{
+  "name": "StuntSense CURE & IndoBERT Pipeline",
+  "description": "Production platform for automated text and data labeling combined with CURE clustering on child stunting datasets sourced from Excel files.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

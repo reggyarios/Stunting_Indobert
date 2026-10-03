@@ -1,0 +1,296 @@
+<!DOCTYPE html>
+<html lang="id" class="h-full bg-[#f9fbf9] text-[#223124]">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>StuntSense - Analisis & Rekomendasi Gizi Balita</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+  <script>
+    tailwind.config = {
+      theme: {
+        extend: {
+          fontFamily: {
+            sans: ['"Plus Jakarta Sans"', 'sans-serif']
+          },
+          colors: {
+            sage: {
+              50: '#f4f7f4',
+              100: '#eef3ee',
+              200: '#dce6dc',
+              500: '#58725c',
+              600: '#49604d',
+              700: '#3d5140',
+              900: '#1e2920'
+            }
+          }
+        }
+      }
+    }
+  </script>
+</head>
+<body class="min-h-full flex flex-col font-sans selection:bg-[#dbe6dc] selection:text-[#253628] antialiased">
+
+  <!-- Header -->
+  <header class="border-b border-[#e2eae2] bg-white/90 backdrop-blur sticky top-0 z-30">
+    <div class="max-w-5xl mx-auto px-6 h-16 flex items-center justify-between">
+      <div class="flex items-center gap-2.5">
+        <span class="w-2.5 h-2.5 rounded-full bg-[#58725c]"></span>
+        <span class="text-base font-semibold tracking-tight text-[#1e2920]">StuntSense</span>
+      </div>
+
+      <div class="hidden sm:block text-xs text-[#5c6e5e]">
+        Sistem Pemantauan Pertumbuhan & Gizi Balita
+      </div>
+
+      <div class="flex items-center gap-3">
+        <a href="/sample-dataset" class="text-xs font-medium text-[#465b49] hover:text-[#253628] border border-[#d2ded2] hover:border-[#b4c7b4] bg-[#f4f7f4] rounded-md px-3.5 py-1.5 transition-colors whitespace-nowrap">
+          Unduh Format Contoh
+        </a>
+      </div>
+    </div>
+  </header>
+
+  <!-- Main Viewport -->
+  <main class="flex-1 max-w-5xl w-full mx-auto px-6 py-10 space-y-8">
+
+    <!-- Flash Notifications -->
+    {% with messages = get_flashed_messages(with_categories=true) %}
+      {% if messages %}
+        <div class="space-y-2">
+          {% for category, message in messages %}
+            <div class="p-3.5 rounded-lg border text-xs font-medium {% if category == 'error' %}border-[#ebd0d0] bg-[#fdf5f5] text-[#912d2d]{% else %}border-[#d2dfd2] bg-[#f2f7f2] text-[#334c37]{% endif %}">
+              {{ message }}
+            </div>
+          {% endfor %}
+        </div>
+      {% endif %}
+    {% endwith %}
+
+    <!-- Hero Title Section -->
+    <section class="space-y-2 max-w-2xl">
+      <h1 class="text-2xl sm:text-3xl font-semibold tracking-tight text-[#1b261d]">
+        Analisis Data & Rekomendasi Gizi Balita
+      </h1>
+      <p class="text-xs sm:text-sm text-[#556958] leading-relaxed">
+        Unggah berkas data penimbangan anak untuk pengelompokan status gizi dan penyusunan saran menu makanan bergizi serta tindakan pencegahan stunting.
+      </p>
+    </section>
+
+    <!-- Upload Card -->
+    <div class="bg-white border border-[#e2ebe2] rounded-xl p-6 sm:p-8 space-y-6 shadow-xs max-w-2xl">
+      
+      <div class="border-b border-[#edf2ed] pb-4 flex items-center justify-between">
+        <h2 class="text-sm font-semibold text-[#1e2920]">Unggah Berkas Excel</h2>
+        <span class="text-xs text-[#6e8070]">Format .xlsx atau .xls</span>
+      </div>
+
+      <form id="uploadForm" action="/upload" method="POST" enctype="multipart/form-data" class="space-y-6">
+        
+        <!-- Dropzone Container -->
+        <div id="dropzone" class="border-2 border-dashed border-[#ccd9cc] hover:border-[#6e8a72] rounded-lg p-8 text-center transition-colors cursor-pointer bg-[#fafcfa] hover:bg-[#f3f7f3] space-y-3">
+          <input type="file" id="fileInput" name="file" accept=".xlsx,.xls" class="hidden">
+          <div class="w-10 h-10 mx-auto rounded-full bg-[#ebf2eb] flex items-center justify-center text-[#556e59]">
+            <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.8" d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12" />
+            </svg>
+          </div>
+          <div class="text-sm font-medium text-[#243527]">
+            Pilih atau seret berkas Excel ke sini
+          </div>
+          <div class="text-xs text-[#687b6a]">
+            Mendukung data multi-lembar puskesmas dan posyandu
+          </div>
+        </div>
+
+        <!-- Selected File Details Bar -->
+        <div id="fileInfo" class="hidden p-3 border border-[#dce6dc] bg-[#f4f8f4] rounded-lg flex items-center justify-between text-xs">
+          <div class="flex items-center gap-2.5 truncate">
+            <span class="w-2 h-2 rounded-full bg-[#58725c] shrink-0"></span>
+            <span id="fileName" class="font-medium text-[#202e22] truncate">dataset.xlsx</span>
+            <span id="fileSize" class="text-[#647766] font-mono shrink-0">0 KB</span>
+          </div>
+          <button type="button" id="removeFileBtn" class="text-[#6d826f] hover:text-[#9e3a3a] text-xs font-medium ml-3 shrink-0">
+            Ganti
+          </button>
+        </div>
+
+        <!-- CURE Hyperparameters Section (Clean) -->
+        <div class="pt-2 border-t border-[#edf2ed] space-y-3">
+          <div class="flex items-center justify-between text-xs text-[#415344]">
+            <span class="font-medium">Parameter Klaster CURE</span>
+            <span class="font-mono text-[#58725c] bg-[#eef4ee] px-2 py-0.5 rounded">
+              k=<span id="k_val">4</span> &middot; c=<span id="c_val">5</span> &middot; &alpha;=<span id="alpha_val">0.3</span>
+            </span>
+          </div>
+
+          <div class="grid grid-cols-1 sm:grid-cols-3 gap-4">
+            <div class="space-y-1">
+              <div class="flex justify-between text-[11px] text-[#556957]">
+                <span>Jumlah Klaster (k)</span>
+                <span class="font-mono" id="k_disp">4</span>
+              </div>
+              <input type="range" id="n_clusters" name="n_clusters" min="2" max="6" value="4" class="w-full accent-[#58725c] cursor-pointer">
+            </div>
+
+            <div class="space-y-1">
+              <div class="flex justify-between text-[11px] text-[#556957]">
+                <span>Titik Perwakilan (c)</span>
+                <span class="font-mono" id="c_disp">5</span>
+              </div>
+              <input type="range" id="n_representatives" name="n_representatives" min="2" max="8" value="5" class="w-full accent-[#58725c] cursor-pointer">
+            </div>
+
+            <div class="space-y-1">
+              <div class="flex justify-between text-[11px] text-[#556957]">
+                <span>Faktor Penyusutan (&alpha;)</span>
+                <span class="font-mono" id="alpha_disp">0.3</span>
+              </div>
+              <input type="range" id="shrink_factor" name="shrink_factor" min="0.1" max="0.6" step="0.05" value="0.3" class="w-full accent-[#58725c] cursor-pointer">
+            </div>
+          </div>
+        </div>
+
+        <!-- Submit Actions -->
+        <div class="pt-2 flex flex-col sm:flex-row items-center gap-3">
+          <button type="submit" id="submitBtn" class="w-full sm:w-auto flex-1 bg-[#58725c] hover:bg-[#49604d] text-white font-medium py-2 px-5 rounded-md text-xs transition-colors shadow-xs">
+            Mulai Analisis
+          </button>
+          <button type="button" id="loadBenchmarkBtn" class="w-full sm:w-auto border border-[#ccd9cc] hover:border-[#b4c7b4] text-[#3d5140] hover:text-[#1e2920] bg-white font-medium py-2 px-4 rounded-md text-xs transition-colors">
+            Gunakan Data Contoh
+          </button>
+        </div>
+
+      </form>
+    </div>
+
+    <!-- Processing Overlay Modal -->
+    <div id="loadingOverlay" class="fixed inset-0 z-50 bg-[#1e2920]/25 backdrop-blur-xs hidden flex items-center justify-center p-6">
+      <div class="max-w-sm w-full bg-white border border-[#dbe5db] rounded-xl p-6 space-y-4 shadow-lg text-center">
+        <div class="w-8 h-8 mx-auto rounded-full bg-[#eef4ee] flex items-center justify-center text-[#58725c] animate-pulse">
+          <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
+          </svg>
+        </div>
+        <div class="space-y-1">
+          <div class="text-sm font-semibold text-[#1e2920]">Sedang Memproses Data</div>
+          <div class="text-xs text-[#556957]">Menyusun pengelompokan dan saran gizi anak...</div>
+        </div>
+        <div class="w-full bg-[#ebf2eb] rounded-full h-1.5 overflow-hidden">
+          <div id="progressBar" class="bg-[#58725c] h-1.5 rounded-full transition-all duration-300 w-1/4"></div>
+        </div>
+      </div>
+    </div>
+
+  </main>
+
+  <!-- Clean Minimalist Footer -->
+  <footer class="border-t border-[#e2eae2] bg-white py-5 text-center text-xs text-[#6e8270] mt-auto">
+    <div class="max-w-5xl mx-auto px-6 flex flex-col sm:flex-row items-center justify-between gap-3">
+      <div>StuntSense &middot; Sistem Pemantauan Pertumbuhan & Gizi Balita</div>
+      <div class="text-[11px] text-[#869988]">Standar Antropometri Kemenkes RI</div>
+    </div>
+  </footer>
+
+  <script>
+    const kSlider = document.getElementById('n_clusters');
+    const cSlider = document.getElementById('n_representatives');
+    const alphaSlider = document.getElementById('shrink_factor');
+
+    kSlider.addEventListener('input', (e) => {
+      document.getElementById('k_val').textContent = e.target.value;
+      document.getElementById('k_disp').textContent = e.target.value;
+    });
+    cSlider.addEventListener('input', (e) => {
+      document.getElementById('c_val').textContent = e.target.value;
+      document.getElementById('c_disp').textContent = e.target.value;
+    });
+    alphaSlider.addEventListener('input', (e) => {
+      document.getElementById('alpha_val').textContent = e.target.value;
+      document.getElementById('alpha_disp').textContent = e.target.value;
+    });
+
+    const dropzone = document.getElementById('dropzone');
+    const fileInput = document.getElementById('fileInput');
+    const fileInfo = document.getElementById('fileInfo');
+    const fileName = document.getElementById('fileName');
+    const fileSize = document.getElementById('fileSize');
+    const removeFileBtn = document.getElementById('removeFileBtn');
+
+    dropzone.addEventListener('click', () => fileInput.click());
+
+    ['dragenter', 'dragover'].forEach(eventName => {
+      dropzone.addEventListener(eventName, (e) => {
+        e.preventDefault();
+        dropzone.classList.add('border-[#58725c]');
+      }, false);
+    });
+
+    ['dragleave', 'drop'].forEach(eventName => {
+      dropzone.addEventListener(eventName, (e) => {
+        e.preventDefault();
+        dropzone.classList.remove('border-[#58725c]');
+      }, false);
+    });
+
+    dropzone.addEventListener('drop', (e) => {
+      if (e.dataTransfer.files && e.dataTransfer.files.length > 0) {
+        fileInput.files = e.dataTransfer.files;
+        handleFileSelection(fileInput.files[0]);
+      }
+    });
+
+    fileInput.addEventListener('change', (e) => {
+      if (e.target.files && e.target.files.length > 0) {
+        handleFileSelection(e.target.files[0]);
+      }
+    });
+
+    function handleFileSelection(file) {
+      if (!file) return;
+      fileName.textContent = file.name;
+      fileSize.textContent = '(' + (file.size / 1024).toFixed(1) + ' KB)';
+      fileInfo.classList.remove('hidden');
+    }
+
+    removeFileBtn.addEventListener('click', () => {
+      fileInput.value = '';
+      fileInfo.classList.add('hidden');
+    });
+
+    const form = document.getElementById('uploadForm');
+    const loadingOverlay = document.getElementById('loadingOverlay');
+    const progressBar = document.getElementById('progressBar');
+
+    form.addEventListener('submit', (e) => {
+      if (!fileInput.files || fileInput.files.length === 0) {
+        alert('Harap pilih berkas Excel terlebih dahulu.');
+        e.preventDefault();
+        return;
+      }
+      loadingOverlay.classList.remove('hidden');
+      setTimeout(() => progressBar.style.width = '60%', 400);
+      setTimeout(() => progressBar.style.width = '90%', 900);
+    });
+
+    const loadBenchmarkBtn = document.getElementById('loadBenchmarkBtn');
+    loadBenchmarkBtn.addEventListener('click', async () => {
+      loadingOverlay.classList.remove('hidden');
+      setTimeout(() => progressBar.style.width = '70%', 300);
+      try {
+        const response = await fetch('/load-benchmark', { method: 'POST' });
+        const data = await response.json();
+        if (data.status === 'success' && data.redirect_url) {
+          window.location.href = data.redirect_url;
+        } else {
+          window.location.reload();
+        }
+      } catch (err) {
+        window.location.reload();
+      }
+    });
+  </script>
+</body>
+</html>

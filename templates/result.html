@@ -1,0 +1,252 @@
+<!DOCTYPE html>
+<html lang="id" class="h-full bg-[#f9fbf9] text-[#223124]">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Hasil Analisis Status Gizi & Rekomendasi Balita - StuntSense</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com">
+  <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+  <script>
+    tailwind.config = {
+      theme: {
+        extend: {
+          fontFamily: {
+            sans: ['"Plus Jakarta Sans"', 'sans-serif']
+          }
+        }
+      }
+    }
+  </script>
+</head>
+<body class="min-h-full flex flex-col font-sans selection:bg-[#dbe6dc] selection:text-[#253628] antialiased">
+
+  <!-- Header -->
+  <header class="border-b border-[#e2eae2] bg-white/90 backdrop-blur sticky top-0 z-30">
+    <div class="max-w-6xl mx-auto px-6 h-16 flex items-center justify-between">
+      <div class="flex items-center gap-2.5">
+        <span class="w-2.5 h-2.5 rounded-full bg-[#58725c]"></span>
+        <span class="text-base font-semibold tracking-tight text-[#1e2920]">StuntSense</span>
+      </div>
+
+      <div class="text-xs text-[#627764] hidden sm:block">
+        Berkas: <span class="text-[#1e2920] font-medium">{{ metrics.original_filename }}</span>
+      </div>
+
+      <div class="flex items-center gap-3">
+        <a href="/" class="text-xs font-medium text-[#465b49] hover:text-[#1e2920] border border-[#d2ded2] hover:border-[#b4c7b4] bg-white rounded-md px-3.5 py-1.5 transition-colors">
+          Unggah Berkas Baru
+        </a>
+        <a href="/download/{{ metrics.job_id }}" class="bg-[#58725c] hover:bg-[#49604d] text-white text-xs font-medium px-4 py-1.5 rounded-md transition-colors whitespace-nowrap shadow-xs">
+          Unduh Excel Hasil
+        </a>
+      </div>
+    </div>
+  </header>
+
+  <!-- Main Viewport -->
+  <main class="flex-1 max-w-6xl w-full mx-auto px-6 py-10 space-y-6">
+
+    <!-- Top Action Bar -->
+    <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-4 border-b border-[#e2ebe2] pb-5">
+      <div>
+        <div class="text-xs text-[#687c69] font-medium">
+          Status: Selesai
+        </div>
+        <h1 class="text-xl sm:text-2xl font-semibold tracking-tight text-[#1b261d] mt-0.5">
+          Hasil Analisis Status Gizi & Rekomendasi
+        </h1>
+      </div>
+
+      <div class="flex items-center gap-3">
+        <a href="/download/{{ metrics.job_id }}" class="flex items-center gap-1.5 bg-[#58725c] hover:bg-[#49604d] text-white text-xs font-medium px-4 py-2 rounded-md transition-colors shadow-xs">
+          <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" />
+          </svg>
+          <span>Unduh {{ metrics.output_filename }}</span>
+        </a>
+      </div>
+    </div>
+
+    <!-- Metrics Cards -->
+    <div class="grid grid-cols-2 sm:grid-cols-4 gap-4">
+      <div class="bg-white border border-[#e2ebe2] rounded-lg p-4 shadow-xs">
+        <div class="text-xs text-[#667a68]">Total Data Anak</div>
+        <div class="text-2xl font-semibold text-[#1e2920] font-mono mt-1 tabular-nums">{{ metrics.total_rows }}</div>
+        <div class="text-[11px] text-[#7d907f] mt-0.5">Seluruh lembar kerja</div>
+      </div>
+
+      <div class="bg-white border border-[#e2ebe2] rounded-lg p-4 shadow-xs">
+        <div class="text-xs text-[#667a68]">Jumlah Lembar / Faskes</div>
+        <div class="text-2xl font-semibold text-[#1e2920] font-mono mt-1 tabular-nums">{{ metrics.processed_sheets }}</div>
+        <div class="text-[11px] text-[#7d907f] mt-0.5">Posyandu & Puskesmas</div>
+      </div>
+
+      <div class="bg-white border border-[#e2ebe2] rounded-lg p-4 shadow-xs">
+        <div class="text-xs text-[#667a68]">Parameter CURE</div>
+        <div class="text-2xl font-semibold text-[#58725c] font-mono mt-1 tabular-nums">k={{ metrics.cure_parameters.clusters_k }}</div>
+        <div class="text-[11px] text-[#7d907f] font-mono mt-0.5">c={{ metrics.cure_parameters.representatives_c }} &middot; &alpha;={{ metrics.cure_parameters.shrink_factor_alpha }}</div>
+      </div>
+
+      <div class="bg-white border border-[#e2ebe2] rounded-lg p-4 shadow-xs">
+        <div class="text-xs text-[#667a68]">Pedoman Standar</div>
+        <div class="text-2xl font-semibold text-[#1e2920] mt-1 text-base leading-tight pt-1">Kemenkes RI</div>
+        <div class="text-[11px] text-[#7d907f] mt-0.5">Permenkes No 2/2020</div>
+      </div>
+    </div>
+
+    <!-- Summary Distributions -->
+    <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
+
+      <!-- Cluster Partition Distribution -->
+      <div class="bg-white border border-[#e2ebe2] rounded-lg p-5 space-y-3 shadow-xs">
+        <div class="flex items-center justify-between border-b border-[#edf2ed] pb-2.5">
+          <h2 class="text-xs font-semibold uppercase tracking-wider text-[#3d5140]">Pengelompokan Klaster CURE</h2>
+          <span class="text-xs font-mono text-[#7d907f]">k={{ metrics.cure_parameters.clusters_k }}</span>
+        </div>
+        <div class="space-y-2.5">
+          {% for cid, count in metrics.cluster_distribution.items() %}
+            <div class="space-y-1">
+              <div class="flex items-center justify-between text-xs">
+                <span class="text-[#2b3c2e] font-medium">{{ cid }}</span>
+                <span class="font-mono text-[#5f7361] tabular-nums">{{ count }} anak ({{ (count / metrics.total_rows * 100)|round(1) }}%)</span>
+              </div>
+              <div class="w-full bg-[#ebf2eb] rounded-full h-1.5 overflow-hidden">
+                <div class="bg-[#58725c] h-1.5 rounded-full" style="width: {{ (count / metrics.total_rows * 100)|round(1) }}%"></div>
+              </div>
+            </div>
+          {% endfor %}
+        </div>
+      </div>
+
+      <!-- Label Distribution -->
+      <div class="bg-white border border-[#e2ebe2] rounded-lg p-5 space-y-3 shadow-xs">
+        <div class="flex items-center justify-between border-b border-[#edf2ed] pb-2.5">
+          <h2 class="text-xs font-semibold uppercase tracking-wider text-[#3d5140]">Kategori Status Gizi</h2>
+          <span class="text-xs font-mono text-[#7d907f]">WHO & Kemenkes</span>
+        </div>
+        <div class="space-y-2.5">
+          {% for label, count in metrics.label_distribution.items() %}
+            <div class="space-y-1">
+              <div class="flex items-center justify-between text-xs">
+                <span class="text-[#2b3c2e] font-medium truncate max-w-[280px]">{{ label }}</span>
+                <span class="font-mono text-[#5f7361] tabular-nums shrink-0">{{ count }} ({{ (count / metrics.total_rows * 100)|round(1) }}%)</span>
+              </div>
+              <div class="w-full bg-[#ebf2eb] rounded-full h-1.5 overflow-hidden">
+                <div class="bg-[#78967c] h-1.5 rounded-full" style="width: {{ (count / metrics.total_rows * 100)|round(1) }}%"></div>
+              </div>
+            </div>
+          {% endfor %}
+        </div>
+      </div>
+
+    </div>
+
+    <!-- Multi-Sheet Preview Tables -->
+    <div class="bg-white border border-[#e2ebe2] rounded-lg overflow-hidden shadow-xs">
+      
+      <!-- Sheet Tabs Header -->
+      <div class="border-b border-[#edf2ed] bg-[#fafcfa] px-6 py-3 flex items-center justify-between flex-wrap gap-4">
+        <div class="flex items-center gap-1.5 overflow-x-auto">
+          {% for sheet_name in metrics.sheets.keys() %}
+            <button onclick="switchSheet('{{ sheet_name }}')" id="tab-{{ sheet_name }}" class="sheet-tab px-3 py-1.5 text-xs font-medium rounded-md transition-colors whitespace-nowrap {% if loop.first %}bg-white text-[#1e2920] border border-[#cfdacd] shadow-xs{% else %}text-[#627764] hover:text-[#253628]{% endif %}">
+              {{ sheet_name }} ({{ metrics.sheets[sheet_name].row_count }})
+            </button>
+          {% endfor %}
+        </div>
+        <div class="text-xs text-[#7d907f]">
+          Pratinjau Data Penimbangan & Rekomendasi
+        </div>
+      </div>
+
+      <!-- Sheet Table Contents -->
+      {% for sheet_name, sheet_data in metrics.sheets.items() %}
+        <div id="content-{{ sheet_name }}" class="sheet-content {% if not loop.first %}hidden{% endif %}">
+          
+          <div class="overflow-x-auto">
+            <table class="w-full text-left text-xs divide-y divide-[#edf2ed]">
+              <thead class="bg-[#f5f8f5] text-[#415344] font-medium">
+                <tr>
+                  <th class="px-4 py-2.5 whitespace-nowrap">Klaster</th>
+                  <th class="px-4 py-2.5 whitespace-nowrap">Status Gizi</th>
+                  <th class="px-4 py-2.5 whitespace-nowrap">Prioritas</th>
+                  <th class="px-4 py-2.5 whitespace-nowrap">Saran Asupan Nutrisi</th>
+                  <th class="px-4 py-2.5 whitespace-nowrap">Tindakan Medis & Sanitasi</th>
+                  <th class="px-4 py-2.5 whitespace-nowrap">Jadwal Pantau</th>
+                  {% for col in sheet_data.columns %}
+                    {% if col not in ['Cluster_ID', 'Auto_Label', 'Label_Confidence', 'Clinical_Priority', 'Saran_Asupan_Nutrisi', 'Tindakan_Medis_Sanitasi', 'Jadwal_Monitoring'] %}
+                      <th class="px-4 py-2.5 whitespace-nowrap font-normal text-[#647766]">{{ col }}</th>
+                    {% endif %}
+                  {% endfor %}
+                </tr>
+              </thead>
+              <tbody class="divide-y divide-[#f2f6f2] bg-white">
+                {% for row in sheet_data.preview_rows %}
+                  <tr class="hover:bg-[#f8faf8] transition-colors">
+                    <td class="px-4 py-2.5 font-mono text-[#435e47] font-semibold tabular-nums whitespace-nowrap">
+                      Klaster {{ row.Cluster_ID }}
+                    </td>
+                    <td class="px-4 py-2.5 font-medium text-[#1e2920] max-w-[170px] truncate" title="{{ row.Auto_Label }}">
+                      {{ row.Auto_Label }}
+                    </td>
+                    <td class="px-4 py-2.5 whitespace-nowrap text-[#495f4c]">
+                      {{ row.Clinical_Priority }}
+                    </td>
+                    <td class="px-4 py-2.5 text-[#405443] max-w-xs truncate" title="{{ row.Saran_Asupan_Nutrisi }}">
+                      {{ row.Saran_Asupan_Nutrisi }}
+                    </td>
+                    <td class="px-4 py-2.5 text-[#405443] max-w-xs truncate" title="{{ row.Tindakan_Medis_Sanitasi }}">
+                      {{ row.Tindakan_Medis_Sanitasi }}
+                    </td>
+                    <td class="px-4 py-2.5 text-[#627764] whitespace-nowrap text-[11px]">
+                      {{ row.Jadwal_Monitoring }}
+                    </td>
+                    {% for col in sheet_data.columns %}
+                      {% if col not in ['Cluster_ID', 'Auto_Label', 'Label_Confidence', 'Clinical_Priority', 'Saran_Asupan_Nutrisi', 'Tindakan_Medis_Sanitasi', 'Jadwal_Monitoring'] %}
+                        <td class="px-4 py-2.5 text-[#4f6452] whitespace-nowrap tabular-nums">
+                          {{ row[col] if row[col] is not none else '-' }}
+                        </td>
+                      {% endif %}
+                    {% endfor %}
+                  </tr>
+                {% endfor %}
+              </tbody>
+            </table>
+          </div>
+
+        </div>
+      {% endfor %}
+
+    </div>
+
+  </main>
+
+  <!-- Clean Minimalist Footer -->
+  <footer class="border-t border-[#e2eae2] bg-white py-5 text-center text-xs text-[#6e8270] mt-auto">
+    <div class="max-w-6xl mx-auto px-6 flex flex-col sm:flex-row items-center justify-between gap-3">
+      <div>StuntSense &middot; Sistem Pemantauan Pertumbuhan & Gizi Balita</div>
+      <div class="text-[11px] text-[#869988]">Standar Antropometri Kemenkes RI</div>
+    </div>
+  </footer>
+
+  <script>
+    function switchSheet(sheetName) {
+      document.querySelectorAll('.sheet-content').forEach(el => el.classList.add('hidden'));
+      document.querySelectorAll('.sheet-tab').forEach(el => {
+        el.classList.remove('bg-white', 'text-[#1e2920]', 'border', 'border-[#cfdacd]', 'shadow-xs');
+        el.classList.add('text-[#627764]');
+      });
+
+      const targetContent = document.getElementById('content-' + sheetName);
+      const targetTab = document.getElementById('tab-' + sheetName);
+
+      if (targetContent) targetContent.classList.remove('hidden');
+      if (targetTab) {
+        targetTab.classList.add('bg-white', 'text-[#1e2920]', 'border', 'border-[#cfdacd]', 'shadow-xs');
+        targetTab.classList.remove('text-[#627764]');
+      }
+    }
+  </script>
+</body>
+</html>
