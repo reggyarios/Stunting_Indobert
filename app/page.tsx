@@ -532,7 +532,11 @@ export default function StuntSensePage() {
                     className="bg-white border border-[#cfdacd] rounded-md px-2.5 py-1 text-xs text-[#324534] focus:outline-none focus:border-[#58725c]"
                   >
                     <option value="ALL">Semua Klaster</option>
-                    {Array.from({ length: pipelineResult.cureParams.k }).map((_, i) => (
+                    {currentSheet?.clusterProfiles?.map((cp) => (
+                      <option key={cp.clusterId} value={String(cp.clusterId)}>
+                        {cp.clusterName} ({cp.count})
+                      </option>
+                    )) || Array.from({ length: pipelineResult.cureParams.k }).map((_, i) => (
                       <option key={i} value={String(i)}>Klaster {i}</option>
                     ))}
                   </select>
@@ -545,7 +549,7 @@ export default function StuntSensePage() {
                 <table className="w-full text-left text-xs divide-y divide-[#edf2ed]">
                   <thead className="bg-[#f5f8f5] text-[#415344] font-medium">
                     <tr>
-                      <th className="px-4 py-2.5 whitespace-nowrap">Klaster</th>
+                      <th className="px-4 py-2.5 whitespace-nowrap">Klaster CURE</th>
                       <th className="px-4 py-2.5 whitespace-nowrap">Status Gizi</th>
                       <th className="px-4 py-2.5 whitespace-nowrap">Prioritas</th>
                       <th className="px-4 py-2.5 whitespace-nowrap">Saran Asupan Nutrisi</th>
@@ -554,7 +558,7 @@ export default function StuntSensePage() {
                       <th className="px-4 py-2.5 whitespace-nowrap">Rincian</th>
                       {currentSheet?.columns
                         .filter(col => ![
-                          'Cluster_ID', 'Auto_Label', 'Label_Confidence', 'Clinical_Priority',
+                          'Cluster_ID', 'Cluster_Name', 'Auto_Label', 'Label_Confidence', 'Clinical_Priority',
                           'Saran_Asupan_Nutrisi', 'Tindakan_Medis_Sanitasi', 'Jadwal_Monitoring'
                         ].includes(col))
                         .map(col => (
@@ -565,8 +569,13 @@ export default function StuntSensePage() {
                   <tbody className="divide-y divide-[#f2f6f2] bg-white">
                     {filteredRecords.slice(0, 50).map((row, rIdx) => (
                       <tr key={rIdx} className="hover:bg-[#f8faf8] transition-colors">
-                        <td className="px-4 py-2.5 font-mono text-[#435e47] font-semibold tabular-nums whitespace-nowrap">
-                          Klaster {row.Cluster_ID}
+                        <td className="px-4 py-2.5 whitespace-nowrap">
+                          <div className="font-mono text-[#435e47] font-semibold">Klaster {row.Cluster_ID}</div>
+                          {row.Cluster_Name && (
+                            <div className="text-[10px] text-[#6d826f] max-w-[130px] truncate" title={row.Cluster_Name}>
+                              {row.Cluster_Name.replace(/^Klaster \d+\s*/, '').replace(/[()]/g, '')}
+                            </div>
+                          )}
                         </td>
                         <td className="px-4 py-2.5 font-medium text-[#1e2920] max-w-[170px] truncate" title={row.Auto_Label}>
                           {row.Auto_Label}

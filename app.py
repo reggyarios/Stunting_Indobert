@@ -364,20 +364,74 @@ class IndoBERTStuntingLabeler:
         """
         results = []
         for r in records:
-            # Extract standard anthropometric metrics
-            haz = self._extract_float(r, ["haz", "zscore_tb_u", "z_score_tb", "zscore_tbu", "tb_u", "zscore"])
-            waz = self._extract_float(r, ["waz", "zscore_bb_u", "z_score_bb", "zscore_bbu", "bb_u"])
+            # Extract standard anthropometric metrics with robust normalized key matching
+            haz = self._extract_float(r, ["haz", "zscore_tb_u", "z_score_tb_u", "zscore_tbu", "tb_u", "zscore_tb", "zscore"])
+            waz = self._extract_float(r, ["waz", "zscore_bb_u", "z_score_bb_u", "zscore_bbu", "bb_u", "zscore_bb"])
             whz = self._extract_float(r, ["whz", "zscore_bb_tb", "z_score_bb_tb", "bb_tb"])
-            
+            usia = self._extract_float(r, ["usia_bulan", "umur_bulan", "usia", "umur", "bulan", "age"])
+            tb = self._extract_float(r, ["tinggi_badan_cm", "tinggi_badan", "tb_cm", "tinggi", "tb", "height"])
+            bb = self._extract_float(r, ["berat_badan_kg", "berat_badan", "bb_kg", "berat", "bb", "weight"])
+
+            # Gender detection
+            gender = "L"
+            for k, v in r.items():
+                k_norm = re.sub(r'[^a-z0-9]', '_', str(k).lower())
+                if any(g in k_norm for g in ["jk", "gender", "jenis_kelamin"]):
+                    v_str = str(v).lower().strip()
+                    if v_str.startswith("p") or "perempuan" in v_str or "wanita" in v_str:
+                        gender = "P"
+
+            # Child name extraction
+            child_name = ""
+            for k, v in r.items():
+                k_l = str(k).lower().strip()
+                if any(x in k_l for x in ["nama", "balita", "anak", "bayi", "name"]) and not any(x in k_l for x in ["posyandu", "puskesmas", "desa", "ibu", "ortu", "ayah"]):
+                    if pd.notna(v) and len(str(v).strip()) > 1 and not str(v).replace(".", "").isdigit():
+                        child_name = str(v).strip()
+                        break
+
             # Clinical and nutritional text notes
             notes = ""
             if text_col and text_col in r:
                 notes = str(r[text_col])
             else:
                 for k, v in r.items():
-                    if any(kw in k.lower() for kw in ["catatan", "keterangan", "diagnosa", "keluhan", "notes", "riwayat", "status_gizi"]):
+                    k_l = str(k).lower()
+                    if any(kw in k_l for kw in ["catatan", "keterangan", "diagnosa", "keluhan", "notes", "riwayat", "status", "hasil"]):
                         notes += f" {v}"
             notes_clean = notes.lower().strip()
+
+            # Automatic WHO Z-score calculation if HAZ is absent but TB & Usia are provided
+            if haz is None and tb is not None and usia is not None:
+                is_boy = (gender == "L")
+                h_med = (50.0 + 1.85 * usia - 0.035 * usia * usia) if (is_boy and usia <= 24) else (
+                    (87.8 + 0.65 * (usia - 24)) if is_boy else (
+                        (49.0 + 1.80 * usia - 0.035 * usia * usia) if usia <= 24 else (86.5 + 0.63 * (usia - 24))
+                    )
+                )
+                h_sd = 2.1 + 0.04 * usia
+                haz = round((tb - h_med) / h_sd, 2)
+
+            if waz is None and bb is not None and usia is not None:
+                is_boy = (gender == "L")
+                w_med = (3.3 + 0.52 * usia - 0.005 * usia * usia) if (is_boy and usia <= 24) else (
+                    (12.2 + 0.18 * (usia - 24)) if is_boy else (
+                        (3.2 + 0.49 * usia - 0.005 * usia * usia) if usia <= 24 else (11.5 + 0.17 * (usia - 24))
+                    )
+                )
+                w_sd = 0.5 + 0.03 * usia
+                waz = round((bb - w_med) / w_sd, 2)
+
+            # Qualitative text fallback if HAZ is still absent
+            if haz is None:
+                if "sangat pendek" in notes_clean or "severely stunted" in notes_clean:
+                    haz = -3.4
+                elif "pendek" in notes_clean or "stunted" in notes_clean:
+                    haz = -2.4
+                elif "normal" in notes_clean or "gizi baik" in notes_clean:
+                    haz = 0.1
+                elif "tinggi" in notes_clean:
+                    haz = 2.3
 
             # Textual semantic cues
             has_severe_text = any(m in notes_clean for m in self.CLINICAL_LEXICON["severe_markers"])
@@ -418,7 +472,7 @@ class IndoBERTStuntingLabeler:
                         label_key = "GIZI_KURANG_RISIKO"
                         confidence = 0.88
                         priority = "Sedang (Pemantauan Pertumbuhan Intensif)"
-                    elif has_severe_text or has_faltering:
+                    elif has_severe_text or has_faltering or has_mod_text:
                         label_key = "GIZI_KURANG_RISIKO"
                         confidence = 0.82
                         priority = "Sedang (Edukasi PMBA & Pemantauan)"
@@ -445,13 +499,23 @@ class IndoBERTStuntingLabeler:
                     confidence = 0.85
                     priority = "Rendah (Pemantauan Rutin)"
                 else:
-                    label_key = "GIZI_KURANG_RISIKO"
+                    label_key = "NORMAL_OPTIMAL"
                     confidence = 0.70
-                    priority = "Sedang (Evaluasi Ulang)"
+                    priority = "Rendah (Evaluasi Berkala)"
 
-            # Extract age in months for age-specific MPASI/feeding guidance
-            usia = self._extract_float(r, ["usia", "umur", "bulan", "age", "usia_bulan", "umur_bulan"])
-            rec = self.generate_interventions(label_key, usia, haz, waz, whz, notes_clean)
+            # Generate individual recommendations
+            rec = self.generate_interventions(
+                label_key=label_key,
+                age_months=usia,
+                haz=haz,
+                waz=waz,
+                whz=whz,
+                tb=tb,
+                bb=bb,
+                child_name=child_name,
+                gender=gender,
+                notes=notes_clean
+            )
 
             results.append({
                 "auto_label": self.LABEL_TAXONOMY[label_key],
@@ -471,74 +535,120 @@ class IndoBERTStuntingLabeler:
     @classmethod
     def generate_interventions(cls, label_key: str, age_months: Optional[float],
                                haz: Optional[float], waz: Optional[float],
-                               whz: Optional[float], notes: str) -> Dict[str, str]:
+                               whz: Optional[float], tb: Optional[float],
+                               bb: Optional[float], child_name: str,
+                               gender: str, notes: str) -> Dict[str, str]:
         """
-        Generate detailed, clinically grounded dietary and medical interventions
-        aligned with Indonesian Ministry of Health (Kemenkes RI) & WHO child growth guidelines.
+        Generate deeply customized, clinically grounded dietary and medical interventions
+        per individual child based on exact age, gender, anthropometrics, deficit, and medical notes.
         """
         is_severe = (label_key in ["STUNTING_BERAT_KOMORBID", "STUNTING_KRONIS", "GIZI_BURUK_AKUT"]
                      or (haz is not None and haz < -3.0))
         is_moderate = (label_key in ["STUNTING_SEDANG", "GIZI_KURANG_RISIKO"]
                        or (haz is not None and -3.0 <= haz < -2.0))
         is_overweight = (label_key == "RISIKO_GIZI_LEBIH")
+        is_underweight = (waz is not None and waz < -2.0) or ("kurang" in notes) or ("2t" in notes) or ("bgm" in notes)
+        is_wasted = (whz is not None and whz < -2.0) or ("kurus" in notes) or ("wasting" in notes)
 
-        # 1. Age-specific feeding base guidance
-        age_guidance = ""
+        child_gender_str = "Perempuan" if gender == "P" else ("Laki-laki" if gender == "L" else "")
+        child_tag = f"Anak {child_name}" if child_name else "Balita"
+        age_display = f"{int(age_months)} bln" if age_months is not None else "Usia Balita"
+        header_summary = f"[{child_tag} - {age_display}{', ' + child_gender_str if child_gender_str else ''}]:"
+
+        # 1. Anthropometric gap against WHO Median
+        status_parts = []
+        if haz is not None and age_months is not None:
+            is_boy = (gender == "L")
+            h_med = (50.0 + 1.85 * age_months - 0.035 * age_months * age_months) if (is_boy and age_months <= 24) else (
+                (87.8 + 0.65 * (age_months - 24)) if is_boy else (
+                    (49.0 + 1.80 * age_months - 0.035 * age_months * age_months) if age_months <= 24 else (86.5 + 0.63 * (age_months - 24))
+                )
+            )
+            if tb is not None:
+                diff = round(h_med - tb, 1)
+                if diff > 0:
+                    status_parts.append(f"Tinggi {tb} cm (defisit {diff} cm di bawah median WHO {round(h_med, 1)} cm, Z-Score TB/U: {haz} SD).")
+                else:
+                    status_parts.append(f"Tinggi {tb} cm telah sesuai/di atas median WHO ({round(h_med, 1)} cm, Z-Score TB/U: {haz} SD).")
+            else:
+                status_parts.append(f"Z-Score TB/U tercatat {haz} SD.")
+        elif tb is not None:
+            status_parts.append(f"Tinggi badan tercatat {tb} cm.")
+
+        if waz is not None and age_months is not None:
+            is_boy = (gender == "L")
+            w_med = (3.3 + 0.52 * age_months - 0.005 * age_months * age_months) if (is_boy and age_months <= 24) else (
+                (12.2 + 0.18 * (age_months - 24)) if is_boy else (
+                    (3.2 + 0.49 * age_months - 0.005 * age_months * age_months) if age_months <= 24 else (11.5 + 0.17 * (age_months - 24))
+                )
+            )
+            if bb is not None:
+                diff_w = round(w_med - bb, 1)
+                if diff_w > 0:
+                    status_parts.append(f"Berat {bb} kg (defisit {diff_w} kg dari target median WHO {round(w_med, 1)} kg, Z-Score BB/U: {waz} SD).")
+                else:
+                    status_parts.append(f"Berat {bb} kg (sesuai target median WHO {round(w_med, 1)} kg, Z-Score BB/U: {waz} SD).")
+
+        # 2. Specific age-bracket food consistency, portions, and protein menu
         if age_months is not None:
             if age_months < 6:
-                age_guidance = "Usia < 6 Bulan: Wajib ASI Eksklusif on-demand minimal 8-12 kali sehari semalam tanpa tambahan air putih atau makanan padat apapun."
+                age_menu_plan = "Fase Usia < 6 Bulan: Wajib ASI Eksklusif on-demand minimal 8-12 kali per 24 jam tanpa tambahan air putih atau makanan padat apapun. Ibu menyusui wajib mengonsumsi double protein hewani harian (2 butir telur + 1 porsi ikan kembung/tongkol) dan suplemen kalsium serta tablet tambah darah agar densitas gizi ASI optimal."
             elif 6 <= age_months <= 8:
-                age_guidance = "Usia 6-8 Bulan: MPASI tekstur lumat kental (saring/puree), 2-3 kali makan utama (2-3 sdm bertahap hingga 1/2 mangkuk 250ml) + 1-2 selingan dan tetap ASI."
+                age_menu_plan = "Fase MPASI Awal (6-8 Bulan): Tekstur saring/lumat kental (tidak tumpah saat sendok dimiringkan). Jadwal: 2-3 kali makan utama (mulai 2-3 sdm bertahap hingga 1/2 mangkuk 125ml) + 1-2 selingan padat gizi. Menu harian wajib: 1 butir telur ayam rebus dilumatkan + 1 sdm hati ayam atau ikan kembung suwir saring halus + 1 sdt minyak kelapa sawit/santan matang sebagai pendorong kalori (energy booster)."
             elif 9 <= age_months <= 11:
-                age_guidance = "Usia 9-11 Bulan: MPASI tekstur cincang halus/kasar atau finger foods lunak, 3-4 kali makan utama (1/2 mangkuk 250ml) + 1-2 selingan padat gizi dan ASI."
+                age_menu_plan = "Fase MPASI Lanjutan (9-11 Bulan): Tekstur cincang halus atau finger foods lunak yang mudah dijumput anak. Jadwal: 3-4 kali makan utama (1/2 mangkuk 125-150ml) + 1-2 kali selingan padat gizi dan ASI. Komposisi harian: 1 butir telur ayam + 1 potong ikan laut lokal (lele/kembung/patin kaya omega-3 DHA dan asam amino lisin untuk lempeng pertumbuhan tulang) + 1 sdt minyak kelapa matang atau mentega."
             elif 12 <= age_months <= 23:
-                age_guidance = "Usia 12-23 Bulan: Makanan keluarga menu seimbang, 3-4 kali makan utama (3/4 mangkuk 250ml) + 1-2 selingan kaya protein, ASI diteruskan hingga 2 tahun."
+                age_menu_plan = "Fase Makanan Keluarga & MPASI Baduta (12-23 Bulan): Makanan keluarga dipotong kecil/lunak, 3-4 kali makan utama (3/4 mangkuk 200ml) + 2 kali selingan padat protein (puding telur, nagasari santan, atau perkedel tahu daging) + ASI hingga 2 tahun. Sasaran harian: Minimal 1-2 butir telur ayam + 30-40 gram daging ayam/ikan lokal/hati sapi."
+            elif 24 <= age_months <= 35:
+                age_menu_plan = "Fase Anak Batita (2-3 Tahun): Makanan keluarga menu Isi Piringku 3 kali sehari porsi penuh + 2 selingan buah segar atau kudapan protein hewani. Sasaran harian: 1 butir telur + 1 porsi lauk hewani (ayam, ikan laut, atau daging sapi) + tahu/tempe + sayuran beraneka warna. Hindari jajanan manis kemasan dan minuman berpemanis buatan agar nafsu makan anak tidak turun."
             else:
-                age_guidance = "Usia 2-5 Tahun: Menu keluarga Isi Piringku 3 kali sehari porsi penuh + 2 selingan buah/kudapan berprotein hewani, hindari jajanan manis sebelum makan."
-
-        # 2. Nutritional & Dietary Interventions
-        if is_severe:
-            diet_advice = ("Prioritas Protein Hewani Ganda: Wajib berikan minimal 1 butir telur ayam setiap hari + "
-                           "ikan laut lokal (ikan kembung/lele/tongkol kaya omega-3 DHA dan asam amino esensial untuk "
-                           "lempeng pertumbuhan tulang). Tambahkan hati ayam/sapi 2x seminggu untuk mencukupi cadangan "
-                           "zat besi (mencegah anemia penghambat hormon pertumbuhan). Berikan lemak tambahan (1-2 sdt "
-                           "minyak kelapa, santan matang, atau margarin) pada setiap porsi makan untuk mendongkrak densitas "
-                           "kalori (energy booster). Berikan suplemen tabur gizi mikro (Taburia) dan suplemen zinc sesuai anjuran faskes.")
-        elif is_moderate:
-            diet_advice = ("Perkaya Kualitas MPASI/Pola Makan: Pastikan lauk berprotein hewani hadir di setiap waktu makan "
-                           "(telur, ikan kembung, daging ayam cincang, atau udang). Kombinasikan dengan protein nabati (tempe/tahu) "
-                           "dan sayuran hijau/labu kuning kaya vitamin A. Berikan Makanan Tambahan Pemulihan (PMT) berbasis pangan lokal "
-                           "selama 90 hari. Batasi ketat konsumsi biskuit manis, wafer, dan teh manis agar nafsu makan anak tidak tertekan.")
-        elif is_overweight:
-            diet_advice = ("Pengaturan Porsi Seimbang: Perbanyak serat dari sayur dan buah potong segar, kurangi gorengan, tepung, "
-                           "dan minuman berkadar gula tinggi. Jangan batasi nutrisi esensial protein hewani (tetap berikan telur dan "
-                           "ikan tanpa digoreng tepung). Dorong aktivitas fisik aktif bermain minimal 60 menit per hari.")
+                age_menu_plan = "Fase Anak Prasekolah (3-5 Tahun): Menu gizi seimbang Isi Piringku 3 kali makan utama + 2 kali selingan sehat. Porsi harian: 1 butir telur + 1 porsi protein hewani berkualitas tinggi + sayuran sumber vitamin A & zat besi + susu pasteurisasi tanpa gula/air putih higienis 6-8 gelas."
         else:
-            diet_advice = ("Pertahankan Pola Gizi Seimbang Isi Piringku: 1/3 karbohidrat (nasi/umbi), 1/3 lauk pauk sumber protein hewani "
-                           "dan nabati berkualitas, 1/3 sayuran dan buah beraneka ragam. Pastikan anak sarapan bergizi setiap pagi dan "
-                           "mengonsumsi air minum matang yang higienis.")
+            age_menu_plan = "Pola Makan Balita: Utamakan makanan padat gizi berbasis protein hewani (telur, ikan laut lokal, daging ayam) 3 kali makan utama sehari ditambah selingan sehat."
 
-        final_diet = f"{age_guidance} {diet_advice}".strip()
+        # 3. Clinical dietary intervention based on stunting severity and wasting status
+        if is_severe:
+            targeted_diet = "Intervensi Pemulihan Stunting Kronis / Berat: Wajib konsumsi Double Protein Hewani harian (misal: telur ayam di pagi hari + ikan kembung/hati ayam di siang dan sore). Tambahkan ekstra 1-2 sdt minyak kelapa matang/santan kental pada setiap mangkuk makan anak untuk mengejar ketertinggalan kalori. Bila anak mengalami anoreksia/sulit makan, konsultasikan ke dokter untuk peresepan Pangan Olahan untuk Keperluan Medis Khusus (PKMK) tinggi kalori (1.0-1.5 kkal/ml) serta tabur gizi mikro (Taburia/zinc)."
+        elif is_moderate:
+            targeted_diet = "Intervensi Stunting Sedang / Kejar Tumbuh: Berikan Pemberian Makanan Tambahan (PMT) Pemulihan berbasis bahan pangan lokal selama 90 hari berturut-turut. Setiap menu makan wajib menyertakan minimal 1 butir telur dan sumber zat besi heme (hati ayam/daging) 2 kali seminggu untuk mencegah anemia defisiensi besi yang menghambat sekresi hormon pertumbuhan (GH/IGF-1)."
+        elif is_wasted or is_underweight:
+            targeted_diet = "Intervensi Berat Badan Kurang (Underweight/Wasted): Fokus utama menaikkan berat badan (weight faltering) dengan memperbanyak densitas kalori MPASI (menambahkan santan matang, mentega, atau alpukat) serta porsi selingan protein tinggi sebelum mengejar tinggi badan."
+        elif is_overweight:
+            targeted_diet = "Intervensi Gizi Lebih / Overweight: Pertahankan lauk protein hewani esensial (telur rebus, ikan kukus tanpa tepung), gantikan camilan manis/biskuit olahan dengan buah potong segar (pepaya, pisang, melon) dan sayuran berserat. Dorong aktivitas fisik aktif bermain minimal 60 menit sehari."
+        else:
+            targeted_diet = "Pemeliharaan Gizi Optimal: Pertahankan kecukupan protein hewani setiap hari (1 telur sehari), sayuran beraneka warna, dan air minum matang. Lanjutkan pola makan teratur untuk menjaga kurva pertumbuhan tetap berada di jalur hijau KMS."
 
-        # 3. Medical, Sanitation & Environmental Hygiene Actions
+        final_diet = f"{header_summary} {' '.join(status_parts)} {age_menu_plan} {targeted_diet}".strip()
+
+        # 4. Medical, Sanitation & Environmental Hygiene Actions
         actions = []
-        if "diare" in notes:
-            actions.append("Tatalaksana Diare: Berikan tablet Zinc dispersible selama 10 hari berturut-turut tanpa putus (10 mg untuk usia <6 bulan, 20 mg untuk usia >=6 bulan) + Oralit setiap BAB cair untuk memperbaiki vili usus dan mencegah malabsorpsi gizi.")
-        if any(w in notes for w in ["batuk", "tb", "flek"]):
-            actions.append("Investigasi Infeksi TB: Segera lakukan uji Mantoux / skoring TB anak di Puskesmas bila ada riwayat batuk kronis atau kontak erat serumah dengan orang dewasa penderita TB aktif.")
+        if "diare" in notes or "mencret" in notes or "cair" in notes:
+            actions.append("Tatalaksana Diare Akut: Berikan tablet Zinc dispersible selama 10 hari penuh tanpa putus (10 mg untuk usia <6 bulan, 20 mg untuk usia >=6 bulan) + Larutan Oralit setiap kali BAB cair untuk mempercepat regenerasi mikrovili usus dan menghentikan kehilangan elektrolit.")
+        if any(w in notes for w in ["batuk", "tb", "flek", "kontak erat", "paru"]):
+            actions.append("Skrining Infeksi Tuberkulosis (TB): Segera jadwalkan Uji Mantoux (Tuberkulin) atau Skoring TB Anak di Puskesmas untuk mendeteksi infeksi TB laten/aktif sebagai penyebab primer gagal tumbuh pada balita.")
+        if "demam" in notes or "panas" in notes:
+            actions.append("Pemeriksaan Infeksi Akut: Periksakan ke Puskesmas untuk memastikan tidak ada infeksi saluran kemih (ISK) tersembunyi atau infeksi telinga/saluran napas.")
         if any(w in notes for w in ["bgm", "2t", "tidak naik"]) or is_severe:
-            actions.append("Rujukan Medis Faskes: Rujuk ke dokter spesialis anak / Puskesmas untuk evaluasi red flags gagal tumbuh (growth faltering), skrining infeksi saluran kemih (ISK) asimtomatik, dan pertimbangan terapi Pangan Olahan untuk Keperluan Medis Khusus (PKMK).")
+            actions.append("Rujukan Medis Faskes Tingkat Lanjut: Rujuk anak ke Puskesmas/Dokter Spesialis Anak (Sp.A) untuk evaluasi 'Red Flags' gagal tumbuh, pemeriksaan kadar hemoglobin (skrining anemia defisiensi besi), dan peresepan terapi nutrisi medis PKMK.")
+        elif is_moderate:
+            actions.append("Konseling Gizi Puskesmas: Dampingi ibu balita ke Poli Gizi Puskesmas untuk evaluasi praktik Pemberian Makanan Bayi dan Anak (PMBA) serta verifikasi kepatuhan konsumsi paket PMT lokal.")
 
-        actions.append("Sanitasi & Pencegahan: Berikan obat cacing (Albendazole) rutin tiap 6 bulan untuk anak usia >1 tahun. Rebus air minum keluarga hingga mendidih 100°C. Biasakan Cuci Tangan Pakai Sabun (CTPS) pada 5 waktu kritis (sebelum makan, sebelum mengolah MPASI, setelah BAB/membersihkan popok, dan sebelum menyusui).")
+        if age_months is not None and age_months >= 12:
+            actions.append("Pencegahan Kecacingan: Berikan obat cacing Albendazole 400 mg (atau Pirantel Pamoat) rutin setiap 6 bulan sekali di Posyandu.")
+        else:
+            actions.append("Proteksi Usia Rentan: Hindari paparan lantai kotor langsung saat anak merangkak/bermain untuk memutus siklus enteric enteropathy.")
+
+        actions.append("Sanitasi Lingkungan & CTPS: Biasakan Cuci Tangan Pakai Sabun (CTPS) pada 5 waktu kritis (sebelum makan, sebelum menyuapi anak, sebelum mengolah MPASI, setelah BAB/cebok, dan setelah memegang hewan). Pastikan air minum keluarga dimasak hingga mendidih 100°C.")
+
         final_medical = " ".join(actions)
 
-        # 4. Monitoring Schedule
+        # 5. Monitoring Schedule
         if is_severe:
-            schedule = "Pemantauan Mingguan: Penimbangan berat badan dan evaluasi asupan makanan setiap 1 minggu sekali di Puskesmas atau Faskes rujukan."
-        elif is_moderate:
-            schedule = "Pemantauan Dua Mingguan: Penimbangan berat badan dan pengukuran panjang/tinggi badan setiap 2 minggu sekali di Posyandu/Puskesmas."
+            schedule = "Pemantauan Mingguan: Penimbangan berat badan dan evaluasi asupan gizi setiap 1 minggu sekali di Faskes/Puskesmas rujukan."
+        elif is_moderate or is_underweight or is_wasted:
+            schedule = "Pemantauan Dua Mingguan: Penimbangan BB dan pengukuran PB/TB setiap 2 minggu sekali di Posyandu atau Pos Gizi Puskesmas."
         else:
-            schedule = "Pemantauan Rutin Bulanan: Penimbangan berat badan dan pengukuran panjang/tinggi badan setiap 1 bulan sekali pada Hari Buka Posyandu."
+            schedule = "Pemantauan Rutin Bulanan: Penimbangan BB dan pengukuran PB/TB setiap 1 bulan sekali pada Hari Buka Posyandu."
 
         return {
             "saran_nutrisi": final_diet,
@@ -548,18 +658,19 @@ class IndoBERTStuntingLabeler:
 
     @staticmethod
     def _extract_float(record: Dict[str, Any], candidates: List[str]) -> Optional[float]:
-        """Search and parse floating-point value from candidate keys."""
+        """Search and parse floating-point value from candidate keys with unicode minus support."""
         for k, v in record.items():
             k_clean = str(k).lower().replace(" ", "_").replace("-", "_")
             if any(c == k_clean or k_clean.startswith(c) for c in candidates):
                 if pd.notna(v):
                     try:
-                        # Handle Indonesian decimal comma (e.g., -2,4 -> -2.4)
-                        val_str = str(v).replace(",", ".").strip()
-                        # Extract numerical token
-                        match = re.search(r"[-+]?\d*\.?\d+", val_str)
+                        # Handle unicode minus, en-dash, em-dash, and Indonesian decimal comma
+                        val_str = str(v).replace("\u2212", "-").replace("\u2013", "-").replace("\u2014", "-")
+                        val_str = val_str.replace(",", ".").strip()
+                        match = re.search(r"[-+]?\s*\d*\.?\d+", val_str)
                         if match:
-                            return float(match.group(0))
+                            clean_token = match.group(0).replace(" ", "")
+                            return float(clean_token)
                     except (ValueError, TypeError):
                         continue
         return None
@@ -586,6 +697,31 @@ class StuntingDataPipeline:
             shrink_factor=shrink_factor
         )
         self.labeler = IndoBERTStuntingLabeler()
+
+    @staticmethod
+    def _find_header_row(file_path: Path, sheet_name: str) -> int:
+        """Scan top 15 rows to automatically detect genuine table header row."""
+        try:
+            sample_df = pd.read_excel(file_path, sheet_name=sheet_name, header=None, nrows=15)
+            header_keywords = [
+                "nama", "balita", "anak", "bayi", "nik", "no", "nomor",
+                "usia", "umur", "bulan", "bln", "tgl", "tanggal", "lahir", "ukur",
+                "jk", "jenis_kelamin", "gender", "sex",
+                "bb", "berat", "tb", "pb", "tinggi", "panjang",
+                "haz", "waz", "whz", "zscore", "z_score", "zs", "tb_u", "bb_u", "bb_tb",
+                "status", "gizi", "stunting", "diagnosa", "catatan"
+            ]
+            best_row = 0
+            max_matches = -1
+            for r in range(len(sample_df)):
+                row_vals = [str(x).lower().replace(" ", "_").replace("-", "_") for x in sample_df.iloc[r].dropna()]
+                matches = sum(1 for v in row_vals if any(kw in v for kw in header_keywords))
+                if matches > max_matches:
+                    max_matches = matches
+                    best_row = r
+            return best_row if max_matches >= 2 else 0
+        except Exception:
+            return 0
 
     def process_excel(self, file_path: Path, output_path: Path) -> Dict[str, Any]:
         """
@@ -614,7 +750,8 @@ class StuntingDataPipeline:
             all_records_for_dashboard = []
 
             for sheet_name in sheet_names:
-                df = pd.read_excel(excel_file, sheet_name=sheet_name)
+                header_idx = self._find_header_row(file_path, sheet_name)
+                df = pd.read_excel(excel_file, sheet_name=sheet_name, header=header_idx)
                 # Drop rows that are completely empty
                 df = df.dropna(how="all").reset_index(drop=True)
                 if len(df) == 0:
@@ -700,14 +837,17 @@ class StuntingDataPipeline:
             is_anthro = any(term in col_lower for term in [
                 "usia", "umur", "bulan", "tinggi", "tb", "berat", "bb",
                 "haz", "waz", "whz", "zscore", "z_score", "lila", "imt"
-            ])
             # Exclude identifiers
             is_id = any(term in col_lower for term in ["id", "nik", "no", "kode", "telp"])
-            
             if is_anthro and not is_id:
-                # Clean numerical values
-                s = df[col].astype(str).str.replace(",", ".").str.extract(r"([-+]?\d*\.?\d+)")[0]
-                converted = pd.to_numeric(s, errors="coerce")
+                # Clean numerical values (including unicode minuses and commas)
+                s = (df[col].astype(str)
+                     .str.replace("\u2212", "-", regex=False)
+                     .str.replace("\u2013", "-", regex=False)
+                     .str.replace("\u2014", "-", regex=False)
+                     .str.replace(",", ".", regex=False)
+                     .str.extract(r"([-+]?\s*\d*\.?\d+)")[0])
+                converted = pd.to_numeric(s.str.replace(" ", "", regex=False), errors="coerce")
                 if converted.notna().sum() >= len(df) * 0.4:
                     num_candidates.append((col, converted.fillna(converted.median())))
 
