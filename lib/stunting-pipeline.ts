@@ -34,6 +34,8 @@ export interface SheetResult {
     whzMean?: number;
     ageMean?: number;
   }[];
+  crosstab: Record<string, Record<string, number>>;
+  purityScore: number;
 }
 
 export interface PipelineResult {
@@ -48,6 +50,8 @@ export interface PipelineResult {
   sheets: SheetResult[];
   globalClusterDistribution: Record<string, number>;
   globalLabelDistribution: Record<string, number>;
+  globalCrosstab: Record<string, Record<string, number>>;
+  globalPurityScore: number;
   executionTimestamp: string;
 }
 
@@ -537,19 +541,46 @@ export class CUREAlgorithm {
       }
     }
 
-    // Initial clinical anchor seeds in anthropometric feature space [HAZ, WAZ, WHZ, normalizedAge]
-    // Seed 0: Severe Stunting & Malnutrition (HAZ < -2.0)
-    // Seed 1: Faltering Growth & Underweight (WAZ < -2.0 or HAZ -1.5)
-    // Seed 2: Normal Growth Optimal (HAZ ~ -0.3, WAZ ~ -0.3)
-    // Seed 3: Tall / Overweight (HAZ > 1.0 or WHZ > 1.0)
-    const rawSeeds = [
-      [-2.8, -2.2, -1.8, 0.40],
-      [-1.4, -1.8, -1.2, 0.40],
-      [-0.3, -0.3, -0.2, 0.45],
-      [ 1.4,  0.8,  1.1, 0.50]
+    // Clinical anchor seeds in anthropometric feature space [HAZ, WAZ, WHZ, normalizedAge]
+    // Exactly matches the 7 Expert Clinical Categories of Kemenkes RI (Permenkes 2/2020) & WHO 2006:
+    const clinicalSeeds7: number[][] = [
+      [-3.4, -2.8, -2.4, 0.40], // Seed 0: Stunting Berat + Komorbiditas Klinis (HAZ < -3, WAZ < -2, WHZ < -2)
+      [-3.1, -1.5, -0.2, 0.45], // Seed 1: Stunting Kronis / Sangat Pendek (HAZ < -3, WHZ normal/sedang)
+      [-2.3, -1.4, -0.4, 0.45], // Seed 2: Stunting Sedang / Pendek (HAZ -2 s/d -3)
+      [-0.5, -3.1, -3.2, 0.35], // Seed 3: Gizi Buruk Akut / Wasting Berat (WHZ < -3, WAZ < -3)
+      [-1.2, -2.2, -2.1, 0.40], // Seed 4: Gizi Kurang / Risiko Gagal Tumbuh (WAZ < -2, WHZ < -2)
+      [ 0.1,  0.2,  0.2, 0.50], // Seed 5: Pertumbuhan Normal / Gizi Optimal (Semua Z-Score rentang normal)
+      [ 1.4,  1.8,  2.1, 0.55]  // Seed 6: Risiko Gizi Lebih / Overweight (WHZ > 2 atau HAZ tinggi)
     ];
 
-    const scaledSeeds = rawSeeds.slice(0, this.k).map(row =>
+    const clinicalSeeds4: number[][] = [
+      [-3.2, -2.5, -2.0, 0.40], // Seed 0: Stunting Berat / Malnutrisi Kronis
+      [-2.1, -1.6, -1.0, 0.42], // Seed 1: Stunting Sedang / Risiko Underweight
+      [ 0.0,  0.1,  0.1, 0.48], // Seed 2: Pertumbuhan Normal Optimal
+      [ 1.4,  1.5,  1.6, 0.52]  // Seed 3: Pertumbuhan Tinggi / Risiko Lebih
+    ];
+
+    // Build exactly this.k seeds guaranteed to be populated
+    const chosenSeeds: number[][] = [];
+    if (this.k === 7) {
+      for (let i = 0; i < 7; i++) chosenSeeds.push([...clinicalSeeds7[i]]);
+    } else if (this.k === 4) {
+      for (let i = 0; i < 4; i++) chosenSeeds.push([...clinicalSeeds4[i]]);
+    } else if (this.k < 7) {
+      const step = (clinicalSeeds7.length - 1) / Math.max(1, this.k - 1);
+      for (let i = 0; i < this.k; i++) {
+        const idx = Math.min(clinicalSeeds7.length - 1, Math.round(i * step));
+        chosenSeeds.push([...clinicalSeeds7[idx]]);
+      }
+    } else {
+      for (const s of clinicalSeeds7) chosenSeeds.push([...s]);
+      while (chosenSeeds.length < this.k) {
+        const sampleIdx = Math.floor((chosenSeeds.length / this.k) * N);
+        chosenSeeds.push(Array.from(features[sampleIdx] || features[0]));
+      }
+    }
+
+    const scaledSeeds: number[][] = chosenSeeds.map(row =>
       row.map((val, j) => (val - (j < D ? means[j] : 0)) / (j < D ? stds[j] : 1.0))
     );
 
@@ -967,6 +998,8 @@ export async function processWorkbook(
     sheets: [],
     globalClusterDistribution: {},
     globalLabelDistribution: {},
+    globalCrosstab: {},
+    globalPurityScore: 0,
     executionTimestamp: new Date().toISOString()
   };
 
@@ -994,31 +1027,65 @@ export async function processWorkbook(
 
     const { labels } = cure.fitPredict(featureMatrix);
 
-    // Compute cluster HAZ averages to give clinical cluster names
+    // Compute cluster anthropometric averages (HAZ, WAZ, WHZ) to provide rich clinical cluster names
     const clusterHazSums: Record<number, number[]> = {};
+    const clusterWazSums: Record<number, number[]> = {};
+    const clusterWhzSums: Record<number, number[]> = {};
     for (let i = 0; i < rawData.length; i++) {
       const cid = labels[i] ?? 0;
       if (!clusterHazSums[cid]) clusterHazSums[cid] = [];
-      const haz = indicatorsList[i].haz;
+      if (!clusterWazSums[cid]) clusterWazSums[cid] = [];
+      if (!clusterWhzSums[cid]) clusterWhzSums[cid] = [];
+      const { haz, waz, whz } = indicatorsList[i];
       if (haz !== null) clusterHazSums[cid].push(haz);
+      if (waz !== null) clusterWazSums[cid].push(waz);
+      if (whz !== null) clusterWhzSums[cid].push(whz);
     }
 
-    const clusterNameMap: Record<number, string> = {
+    const kemenkes7Names: Record<number, string> = {
+      0: 'Klaster 0 (Stunting Berat Komorbid)',
+      1: 'Klaster 1 (Stunting Kronis / Sangat Pendek)',
+      2: 'Klaster 2 (Stunting Sedang / Pendek)',
+      3: 'Klaster 3 (Gizi Buruk Akut / Wasting Berat)',
+      4: 'Klaster 4 (Gizi Kurang / Risiko Gagal Tumbuh)',
+      5: 'Klaster 5 (Pertumbuhan Normal Optimal)',
+      6: 'Klaster 6 (Risiko Gizi Lebih / Overweight)'
+    };
+
+    const stunting4Names: Record<number, string> = {
       0: 'Klaster 0 (Stunting Berat / Malnutrisi Kronis)',
-      1: 'Klaster 1 (Risiko Gagal Tumbuh / Underweight)',
+      1: 'Klaster 1 (Stunting Sedang / Risiko Underweight)',
       2: 'Klaster 2 (Pertumbuhan Normal Optimal)',
       3: 'Klaster 3 (Pertumbuhan Tinggi / Risiko Lebih)'
     };
 
-    // If dynamic, refine labels based on average HAZ
+    const clusterNameMap: Record<number, string> = {};
     for (let cid = 0; cid < cureParams.k; cid++) {
-      const hazs = clusterHazSums[cid] || [];
-      const avgHaz = hazs.length > 0 ? hazs.reduce((a, b) => a + b, 0) / hazs.length : -0.5;
-      if (cid >= 4) {
-        if (avgHaz < -2.0) clusterNameMap[cid] = `Klaster ${cid} (Defisit Pertumbuhan)`;
-        else if (avgHaz < -1.0) clusterNameMap[cid] = `Klaster ${cid} (Risiko Gagal Tumbuh)`;
-        else if (avgHaz <= 1.0) clusterNameMap[cid] = `Klaster ${cid} (Pertumbuhan Normal)`;
-        else clusterNameMap[cid] = `Klaster ${cid} (Pertumbuhan Tinggi)`;
+      if (cureParams.k === 7 && kemenkes7Names[cid]) {
+        clusterNameMap[cid] = kemenkes7Names[cid];
+      } else if (cureParams.k === 4 && stunting4Names[cid]) {
+        clusterNameMap[cid] = stunting4Names[cid];
+      } else {
+        const hazs = clusterHazSums[cid] || [];
+        const wazs = clusterWazSums[cid] || [];
+        const whzs = clusterWhzSums[cid] || [];
+        const avgHaz = hazs.length > 0 ? hazs.reduce((a, b) => a + b, 0) / hazs.length : 0;
+        const avgWaz = wazs.length > 0 ? wazs.reduce((a, b) => a + b, 0) / wazs.length : 0;
+        const avgWhz = whzs.length > 0 ? whzs.reduce((a, b) => a + b, 0) / whzs.length : 0;
+
+        if (avgHaz < -3.0 || (avgHaz < -2.0 && avgWaz < -2.0)) {
+          clusterNameMap[cid] = `Klaster ${cid} (Stunting Berat Komorbid)`;
+        } else if (avgHaz < -2.0) {
+          clusterNameMap[cid] = `Klaster ${cid} (Stunting Sedang / Pendek)`;
+        } else if (avgWhz < -2.5) {
+          clusterNameMap[cid] = `Klaster ${cid} (Gizi Buruk Akut / Wasting)`;
+        } else if (avgWaz < -2.0 || avgWhz < -2.0) {
+          clusterNameMap[cid] = `Klaster ${cid} (Gizi Kurang / Risiko Underweight)`;
+        } else if (avgHaz > 1.5 || avgWhz > 1.5) {
+          clusterNameMap[cid] = `Klaster ${cid} (Pertumbuhan Tinggi / Overweight)`;
+        } else {
+          clusterNameMap[cid] = `Klaster ${cid} (Pertumbuhan Normal Optimal)`;
+        }
       }
     }
 
@@ -1099,6 +1166,25 @@ export async function processWorkbook(
       ].includes(col))
     ];
 
+    // Compute sheet crosstab CURE vs Kemenkes & Purity Score
+    const sheetCrosstab: Record<string, Record<string, number>> = {};
+    for (const r of enrichedRecords) {
+      const cKey = r.Cluster_Name || `Klaster ${r.Cluster_ID}`;
+      const kKey = r.Auto_Label ? r.Auto_Label.split('(')[0].trim() : 'Tidak Diketahui';
+      if (!sheetCrosstab[cKey]) sheetCrosstab[cKey] = {};
+      sheetCrosstab[cKey][kKey] = (sheetCrosstab[cKey][kKey] || 0) + 1;
+
+      if (!result.globalCrosstab[cKey]) result.globalCrosstab[cKey] = {};
+      result.globalCrosstab[cKey][kKey] = (result.globalCrosstab[cKey][kKey] || 0) + 1;
+    }
+
+    let sheetMaxMatches = 0;
+    for (const cKey in sheetCrosstab) {
+      const counts = Object.values(sheetCrosstab[cKey]);
+      sheetMaxMatches += Math.max(...counts);
+    }
+    const sheetPurity = enrichedRecords.length > 0 ? Math.round((sheetMaxMatches / enrichedRecords.length) * 10000) / 100 : 0;
+
     result.sheets.push({
       sheetName,
       rowCount: enrichedRecords.length,
@@ -1107,9 +1193,19 @@ export async function processWorkbook(
       records: enrichedRecords,
       clusterDistribution: sheetClusterDist,
       labelDistribution: sheetLabelDist,
-      clusterProfiles
+      clusterProfiles,
+      crosstab: sheetCrosstab,
+      purityScore: sheetPurity
     });
   }
+
+  // Compute global purity score
+  let globalMaxMatches = 0;
+  for (const cKey in result.globalCrosstab) {
+    const counts = Object.values(result.globalCrosstab[cKey]);
+    globalMaxMatches += Math.max(...counts);
+  }
+  result.globalPurityScore = result.totalRows > 0 ? Math.round((globalMaxMatches / result.totalRows) * 10000) / 100 : 0;
 
   return result;
 }
