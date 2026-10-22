@@ -1330,7 +1330,7 @@ export function exportResultToExcel(result: PipelineResult): ArrayBuffer {
 
   // Summary Dashboard Sheet
   const summaryData = [
-    { Metric: 'Sistem Analisis', Value: 'StuntSense CURE & IndoBERT' },
+    { Metric: 'Sistem Analisis', Value: 'CURE-IndoBERT for Stunting Analytics' },
     { Metric: 'Waktu Analisis', Value: result.executionTimestamp },
     { Metric: 'Berkas Sumber', Value: result.originalFilename },
     { Metric: 'Total Data Balita', Value: result.totalRows },

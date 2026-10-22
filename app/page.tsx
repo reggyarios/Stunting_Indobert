@@ -25,7 +25,7 @@ import {
   exportResultToExcel
 } from '@/lib/stunting-pipeline';
 
-export default function StuntSensePage() {
+export default function CureIndoBertStuntingPage() {
   // Hyperparameters (CURE)
   const [nClusters, setNClusters] = useState<number>(4);
   const [nRepresentatives, setNRepresentatives] = useState<number>(5);
@@ -227,13 +227,18 @@ export default function StuntSensePage() {
           {/* Brand */}
           <div className="flex items-center gap-2.5">
             <span className="w-2.5 h-2.5 rounded-full bg-[#58725c]"></span>
-            <span className="text-base font-semibold tracking-tight text-[#1e2920]">
-              StuntSense
-            </span>
+            <div className="flex items-baseline gap-1.5">
+              <span className="text-base font-bold tracking-tight text-[#1e2920]">
+                CURE-IndoBERT
+              </span>
+              <span className="text-xs font-semibold text-[#58725c] tracking-normal">
+                for Stunting
+              </span>
+            </div>
           </div>
 
           <div className="hidden sm:block text-xs text-[#5c6e5e]">
-            Sistem Pemantauan Pertumbuhan & Gizi Balita &middot; Permenkes No 2/2020
+            Klasterisasi CURE &middot; Klasifikasi IndoBERT &middot; Standar Permenkes No 2/2020 &amp; WHO
           </div>
 
           {/* Actions */}
@@ -262,12 +267,16 @@ export default function StuntSensePage() {
       <main className="flex-1 max-w-6xl w-full mx-auto px-6 py-10 space-y-8">
         
         {/* Hero Section */}
-        <section className="space-y-2 max-w-2xl">
+        <section className="space-y-2 max-w-3xl">
+          <div className="inline-flex items-center gap-2 px-2.5 py-1 rounded-full bg-[#eef4ee] border border-[#d6e3d6] text-[11px] font-medium text-[#465c49]">
+            <Sparkles className="w-3 h-3 text-[#58725c]" />
+            <span>Platform Riset Klasterisasi &amp; Klasifikasi Antropometri Balita</span>
+          </div>
           <h1 className="text-2xl sm:text-3xl font-semibold tracking-tight text-[#1b261d]">
-            Analisis Data & Rekomendasi Gizi Balita
+            CURE-IndoBERT for Stunting Analytics
           </h1>
           <p className="text-xs sm:text-sm text-[#556958] leading-relaxed">
-            Pengelompokan status stunting menggunakan algoritma CURE (*Clustering Using Representatives*) dan perumusan menu nutrisi serta tindakan medis individual sesuai standar antropometri WHO dan Kemenkes RI.
+            Sistem analisis data pertumbuhan balita terintegrasi: Klasterisasi spasial CURE (*Clustering Using Representatives*) untuk pengelompokan pola antropometri dan model IndoBERT untuk interpretasi klinis serta perumusan rekomendasi intervensi gizi terpersonalisasi sesuai standar Kemenkes RI &amp; WHO.
           </p>
         </section>
 
@@ -1134,8 +1143,8 @@ export default function StuntSensePage() {
       {/* Clean Footer */}
       <footer className="border-t border-[#e2eae2] bg-white py-5 text-center text-xs text-[#6e8270] mt-auto">
         <div className="max-w-6xl mx-auto px-6 flex flex-col sm:flex-row items-center justify-between gap-3">
-          <div>StuntSense &middot; Sistem Pemantauan Pertumbuhan & Gizi Balita</div>
-          <div className="text-[11px] text-[#869988]">Standar Antropometri Kemenkes RI (Permenkes No 2/2020)</div>
+          <div>CURE-IndoBERT for Stunting &middot; Sistem Analisis Klasterisasi &amp; Intervensi Gizi Balita</div>
+          <div className="text-[11px] text-[#869988]">Standar Antropometri Kemenkes RI (Permenkes No 2/2020) &amp; WHO 2006</div>
         </div>
       </footer>
 

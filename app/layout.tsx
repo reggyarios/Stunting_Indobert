@@ -2,17 +2,17 @@ import type {Metadata} from 'next';
 import './globals.css'; // Global styles
 
 export const metadata: Metadata = {
-  title: 'StuntSense CURE & IndoBERT Pipeline',
-  description: 'Production platform for automated text and data labeling combined with CURE clustering on child stunting datasets sourced from Excel files.',
+  title: 'CURE-IndoBERT for Stunting - Klasterisasi & Klasifikasi Pertumbuhan Balita',
+  description: 'Platform riset dan implementasi sistem klasterisasi CURE dan klasifikasi IndoBERT untuk analisis stunting balita serta rekomendasi intervensi gizi berbasis standar Kemenkes RI & WHO.',
   openGraph: {
-    title: 'StuntSense CURE & IndoBERT Pipeline',
-    description: 'Production platform for automated text and data labeling combined with CURE clustering on child stunting datasets sourced from Excel files.',
+    title: 'CURE-IndoBERT for Stunting - Klasterisasi & Klasifikasi Pertumbuhan Balita',
+    description: 'Platform riset dan implementasi sistem klasterisasi CURE dan klasifikasi IndoBERT untuk analisis stunting balita serta rekomendasi intervensi gizi berbasis standar Kemenkes RI & WHO.',
     type: 'website',
   },
   twitter: {
     card: 'summary_large_image',
-    title: 'StuntSense CURE & IndoBERT Pipeline',
-    description: 'Production platform for automated text and data labeling combined with CURE clustering on child stunting datasets sourced from Excel files.',
+    title: 'CURE-IndoBERT for Stunting - Klasterisasi & Klasifikasi Pertumbuhan Balita',
+    description: 'Platform riset dan implementasi sistem klasterisasi CURE dan klasifikasi IndoBERT untuk analisis stunting balita serta rekomendasi intervensi gizi berbasis standar Kemenkes RI & WHO.',
   },
 };
 
