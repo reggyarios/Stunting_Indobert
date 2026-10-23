@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Hasil Analisis Status Gizi & Rekomendasi Balita - StuntSense</title>
+  <title>Hasil Analisis CURE-IndoBERT - Stunting Analytics</title>
   <script src="https://cdn.tailwindcss.com"></script>
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com">
@@ -27,7 +27,7 @@
     <div class="max-w-6xl mx-auto px-6 h-16 flex items-center justify-between">
       <div class="flex items-center gap-2.5">
         <span class="w-2.5 h-2.5 rounded-full bg-[#58725c]"></span>
-        <span class="text-base font-semibold tracking-tight text-[#1e2920]">StuntSense</span>
+        <span class="text-base font-semibold tracking-tight text-[#1e2920]">CURE-IndoBERT</span>
       </div>
 
       <div class="text-xs text-[#627764] hidden sm:block">
@@ -52,10 +52,10 @@
     <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-4 border-b border-[#e2ebe2] pb-5">
       <div>
         <div class="text-xs text-[#687c69] font-medium">
-          Status: Selesai
+          Status Pipeline: Selesai
         </div>
         <h1 class="text-xl sm:text-2xl font-semibold tracking-tight text-[#1b261d] mt-0.5">
-          Hasil Analisis Status Gizi & Rekomendasi
+          Hasil Analisis Klaster CURE & Status Gizi Balita
         </h1>
       </div>
 
@@ -66,6 +66,16 @@
           </svg>
           <span>Unduh {{ metrics.output_filename }}</span>
         </a>
+      </div>
+    </div>
+
+    <!-- Model Status Notice -->
+    <div class="p-4 rounded-xl border {% if metrics.model_status.is_indobert_rcnn_trained %}border-[#cde3d1] bg-[#f2f8f3] text-[#294a2f]{% else %}border-[#e8ded0] bg-[#fcf9f5] text-[#5c4a30]{% endif %} text-xs flex flex-col sm:flex-row items-start sm:items-center justify-between gap-2">
+      <div>
+        <span class="font-semibold">IndoBERT + RCNN Model:</span> {{ metrics.model_status.message }}
+      </div>
+      <div class="text-[11px] font-mono opacity-80">
+        Klaster CURE: Murni (Guha et al. 1998) &middot; Pedoman: Permenkes 2/2020
       </div>
     </div>
 
@@ -99,14 +109,14 @@
     <!-- Summary Distributions -->
     <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
 
-      <!-- Cluster Partition Distribution -->
+      <!-- CURE Cluster Partition Distribution -->
       <div class="bg-white border border-[#e2ebe2] rounded-lg p-5 space-y-3 shadow-xs">
         <div class="flex items-center justify-between border-b border-[#edf2ed] pb-2.5">
-          <h2 class="text-xs font-semibold uppercase tracking-wider text-[#3d5140]">Pengelompokan Klaster CURE</h2>
+          <h2 class="text-xs font-semibold uppercase tracking-wider text-[#3d5140]">Pengelompokan Klaster Spasial CURE</h2>
           <span class="text-xs font-mono text-[#7d907f]">k={{ metrics.cure_parameters.clusters_k }}</span>
         </div>
         <div class="space-y-2.5">
-          {% for cid, count in metrics.cluster_distribution.items() %}
+          {% for cid, count in metrics.global_cluster_distribution.items() %}
             <div class="space-y-1">
               <div class="flex items-center justify-between text-xs">
                 <span class="text-[#2b3c2e] font-medium">{{ cid }}</span>
@@ -120,14 +130,14 @@
         </div>
       </div>
 
-      <!-- Label Distribution -->
+      <!-- Kemenkes Standard Distribution -->
       <div class="bg-white border border-[#e2ebe2] rounded-lg p-5 space-y-3 shadow-xs">
         <div class="flex items-center justify-between border-b border-[#edf2ed] pb-2.5">
-          <h2 class="text-xs font-semibold uppercase tracking-wider text-[#3d5140]">Kategori Status Gizi</h2>
-          <span class="text-xs font-mono text-[#7d907f]">WHO & Kemenkes</span>
+          <h2 class="text-xs font-semibold uppercase tracking-wider text-[#3d5140]">Kategori Standar Kemenkes RI</h2>
+          <span class="text-xs font-mono text-[#7d907f]">Permenkes No. 2/2020</span>
         </div>
         <div class="space-y-2.5">
-          {% for label, count in metrics.label_distribution.items() %}
+          {% for label, count in metrics.global_kemenkes_distribution.items() %}
             <div class="space-y-1">
               <div class="flex items-center justify-between text-xs">
                 <span class="text-[#2b3c2e] font-medium truncate max-w-[280px]">{{ label }}</span>
@@ -156,7 +166,7 @@
           {% endfor %}
         </div>
         <div class="text-xs text-[#7d907f]">
-          Pratinjau Data Penimbangan & Rekomendasi
+          Pratinjau Data Penimbangan & Hasil Pipeline
         </div>
       </div>
 
@@ -168,14 +178,14 @@
             <table class="w-full text-left text-xs divide-y divide-[#edf2ed]">
               <thead class="bg-[#f5f8f5] text-[#415344] font-medium">
                 <tr>
-                  <th class="px-4 py-2.5 whitespace-nowrap">Klaster</th>
-                  <th class="px-4 py-2.5 whitespace-nowrap">Status Gizi</th>
-                  <th class="px-4 py-2.5 whitespace-nowrap">Prioritas</th>
-                  <th class="px-4 py-2.5 whitespace-nowrap">Saran Asupan Nutrisi</th>
-                  <th class="px-4 py-2.5 whitespace-nowrap">Tindakan Medis & Sanitasi</th>
+                  <th class="px-4 py-2.5 whitespace-nowrap">Klaster CURE</th>
+                  <th class="px-4 py-2.5 whitespace-nowrap">Kategori Kemenkes 2/2020</th>
+                  <th class="px-4 py-2.5 whitespace-nowrap">Prediksi IndoBERT+RCNN</th>
+                  <th class="px-4 py-2.5 whitespace-nowrap">Saran Intervensi Gizi</th>
+                  <th class="px-4 py-2.5 whitespace-nowrap">Rekomendasi Tindakan Medis</th>
                   <th class="px-4 py-2.5 whitespace-nowrap">Jadwal Pantau</th>
                   {% for col in sheet_data.columns %}
-                    {% if col not in ['Cluster_ID', 'Auto_Label', 'Label_Confidence', 'Clinical_Priority', 'Saran_Asupan_Nutrisi', 'Tindakan_Medis_Sanitasi', 'Jadwal_Monitoring'] %}
+                    {% if col not in ['CURE_Cluster_ID', 'IndoBERT_RCNN_Predicted_Label', 'IndoBERT_RCNN_Confidence', 'Kemenkes_Permenkes_2_2020_Category', 'Saran_Intervensi_Gizi', 'Rekomendasi_Tindakan_Klinis', 'Jadwal_Monitoring_Posyandu'] %}
                       <th class="px-4 py-2.5 whitespace-nowrap font-normal text-[#647766]">{{ col }}</th>
                     {% endif %}
                   {% endfor %}
@@ -185,25 +195,25 @@
                 {% for row in sheet_data.preview_rows %}
                   <tr class="hover:bg-[#f8faf8] transition-colors">
                     <td class="px-4 py-2.5 font-mono text-[#435e47] font-semibold tabular-nums whitespace-nowrap">
-                      Klaster {{ row.Cluster_ID }}
+                      Klaster {{ row.CURE_Cluster_ID }}
                     </td>
-                    <td class="px-4 py-2.5 font-medium text-[#1e2920] max-w-[170px] truncate" title="{{ row.Auto_Label }}">
-                      {{ row.Auto_Label }}
+                    <td class="px-4 py-2.5 font-medium text-[#1e2920] max-w-[200px] truncate" title="{{ row.Kemenkes_Permenkes_2_2020_Category }}">
+                      {{ row.Kemenkes_Permenkes_2_2020_Category }}
                     </td>
-                    <td class="px-4 py-2.5 whitespace-nowrap text-[#495f4c]">
-                      {{ row.Clinical_Priority }}
+                    <td class="px-4 py-2.5 text-[#526655] max-w-[160px] truncate">
+                      {{ row.IndoBERT_RCNN_Predicted_Label }}
                     </td>
-                    <td class="px-4 py-2.5 text-[#405443] max-w-xs truncate" title="{{ row.Saran_Asupan_Nutrisi }}">
-                      {{ row.Saran_Asupan_Nutrisi }}
+                    <td class="px-4 py-2.5 text-[#405443] max-w-xs truncate" title="{{ row.Saran_Intervensi_Gizi }}">
+                      {{ row.Saran_Intervensi_Gizi }}
                     </td>
-                    <td class="px-4 py-2.5 text-[#405443] max-w-xs truncate" title="{{ row.Tindakan_Medis_Sanitasi }}">
-                      {{ row.Tindakan_Medis_Sanitasi }}
+                    <td class="px-4 py-2.5 text-[#405443] max-w-xs truncate" title="{{ row.Rekomendasi_Tindakan_Klinis }}">
+                      {{ row.Rekomendasi_Tindakan_Klinis }}
                     </td>
                     <td class="px-4 py-2.5 text-[#627764] whitespace-nowrap text-[11px]">
-                      {{ row.Jadwal_Monitoring }}
+                      {{ row.Jadwal_Monitoring_Posyandu }}
                     </td>
                     {% for col in sheet_data.columns %}
-                      {% if col not in ['Cluster_ID', 'Auto_Label', 'Label_Confidence', 'Clinical_Priority', 'Saran_Asupan_Nutrisi', 'Tindakan_Medis_Sanitasi', 'Jadwal_Monitoring'] %}
+                      {% if col not in ['CURE_Cluster_ID', 'IndoBERT_RCNN_Predicted_Label', 'IndoBERT_RCNN_Confidence', 'Kemenkes_Permenkes_2_2020_Category', 'Saran_Intervensi_Gizi', 'Rekomendasi_Tindakan_Klinis', 'Jadwal_Monitoring_Posyandu'] %}
                         <td class="px-4 py-2.5 text-[#4f6452] whitespace-nowrap tabular-nums">
                           {{ row[col] if row[col] is not none else '-' }}
                         </td>
@@ -225,8 +235,8 @@
   <!-- Clean Minimalist Footer -->
   <footer class="border-t border-[#e2eae2] bg-white py-5 text-center text-xs text-[#6e8270] mt-auto">
     <div class="max-w-6xl mx-auto px-6 flex flex-col sm:flex-row items-center justify-between gap-3">
-      <div>StuntSense &middot; Sistem Pemantauan Pertumbuhan & Gizi Balita</div>
-      <div class="text-[11px] text-[#869988]">Standar Antropometri Kemenkes RI</div>
+      <div>CURE-IndoBERT &middot; Stunting Analytics Pipeline</div>
+      <div class="text-[11px] text-[#869988]">Standar Antropometri WHO & Kemenkes RI Permenkes No. 2/2020</div>
     </div>
   </footer>
 

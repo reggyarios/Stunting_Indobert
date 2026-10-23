@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>StuntSense - Analisis & Rekomendasi Gizi Balita</title>
+  <title>CURE-IndoBERT for Stunting Analytics</title>
   <script src="https://cdn.tailwindcss.com"></script>
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -38,11 +38,11 @@
     <div class="max-w-5xl mx-auto px-6 h-16 flex items-center justify-between">
       <div class="flex items-center gap-2.5">
         <span class="w-2.5 h-2.5 rounded-full bg-[#58725c]"></span>
-        <span class="text-base font-semibold tracking-tight text-[#1e2920]">StuntSense</span>
+        <span class="text-base font-semibold tracking-tight text-[#1e2920]">CURE-IndoBERT</span>
       </div>
 
       <div class="hidden sm:block text-xs text-[#5c6e5e]">
-        Sistem Pemantauan Pertumbuhan & Gizi Balita
+        Stunting Analytics with CURE Clustering & IndoBERT+RCNN
       </div>
 
       <div class="flex items-center gap-3">
@@ -69,13 +69,31 @@
       {% endif %}
     {% endwith %}
 
+    <!-- Architecture & Model Status Banner -->
+    <div class="p-4 rounded-xl border {% if has_checkpoint %}border-[#cde3d1] bg-[#f2f8f3] text-[#294a2f]{% else %}border-[#e8ded0] bg-[#fcf9f5] text-[#5c4a30]{% endif %} text-xs flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3">
+      <div class="flex items-center gap-2.5">
+        <span class="w-2 h-2 rounded-full {% if has_checkpoint %}bg-[#388e3c]{% else %}bg-[#b07d32]{% endif %}"></span>
+        <div>
+          <span class="font-semibold">Status Arsitektur IndoBERT + RCNN:</span>
+          {% if has_checkpoint %}
+            <span class="font-medium text-[#2d5734]"> Checkpoint Model Aktif & Terlatih</span>
+          {% else %}
+            <span class="font-medium text-[#6e5837]"> Belum Ada Checkpoint Terlatih (Inferensi model dinonaktifkan tanpa fallback heuristik semu)</span>
+          {% endif %}
+        </div>
+      </div>
+      <div class="text-[11px] font-mono opacity-80">
+        Klaster CURE: Aktif (c reps, &alpha; shrinkage) &middot; Pedoman: Permenkes 2/2020
+      </div>
+    </div>
+
     <!-- Hero Title Section -->
     <section class="space-y-2 max-w-2xl">
       <h1 class="text-2xl sm:text-3xl font-semibold tracking-tight text-[#1b261d]">
-        Analisis Data & Rekomendasi Gizi Balita
+        CURE-IndoBERT Stunting Analytics
       </h1>
       <p class="text-xs sm:text-sm text-[#556958] leading-relaxed">
-        Unggah berkas data penimbangan anak untuk pengelompokan status gizi dan penyusunan saran menu makanan bergizi serta tindakan pencegahan stunting.
+        Analisis komprehensif data stunting balita menggunakan algoritma klaster spasial <strong>CURE</strong> (Clustering Using Representatives) dan arsitektur transfer learning <strong>IndoBERT + RCNN</strong> untuk ekstraksi catatan medis klinis terstandar Permenkes No. 2/2020.
       </p>
     </section>
 
@@ -83,8 +101,8 @@
     <div class="bg-white border border-[#e2ebe2] rounded-xl p-6 sm:p-8 space-y-6 shadow-xs max-w-2xl">
       
       <div class="border-b border-[#edf2ed] pb-4 flex items-center justify-between">
-        <h2 class="text-sm font-semibold text-[#1e2920]">Unggah Berkas Excel</h2>
-        <span class="text-xs text-[#6e8070]">Format .xlsx atau .xls</span>
+        <h2 class="text-sm font-semibold text-[#1e2920]">Unggah Berkas Excel Balita</h2>
+        <span class="text-xs text-[#6e8070]">Format .xlsx atau .xls (multi-sheet didukung)</span>
       </div>
 
       <form id="uploadForm" action="/upload" method="POST" enctype="multipart/form-data" class="space-y-6">
@@ -101,7 +119,7 @@
             Pilih atau seret berkas Excel ke sini
           </div>
           <div class="text-xs text-[#687b6a]">
-            Mendukung data multi-lembar puskesmas dan posyandu
+            Otomatis mendeteksi baris header dan indikator Z-Score (TB/U, BB/U, BB/TB)
           </div>
         </div>
 
@@ -117,10 +135,10 @@
           </button>
         </div>
 
-        <!-- CURE Hyperparameters Section (Clean) -->
-        <div class="pt-2 border-t border-[#edf2ed] space-y-3">
+        <!-- CURE Hyperparameters Section -->
+        <div class="pt-2 border-t border-[#edf2ed] space-y-4">
           <div class="flex items-center justify-between text-xs text-[#415344]">
-            <span class="font-medium">Parameter Klaster CURE</span>
+            <span class="font-medium">Parameter Algoritma CURE (Guha et al. 1998)</span>
             <span class="font-mono text-[#58725c] bg-[#eef4ee] px-2 py-0.5 rounded">
               k=<span id="k_val">4</span> &middot; c=<span id="c_val">5</span> &middot; &alpha;=<span id="alpha_val">0.3</span>
             </span>
@@ -156,10 +174,10 @@
         <!-- Submit Actions -->
         <div class="pt-2 flex flex-col sm:flex-row items-center gap-3">
           <button type="submit" id="submitBtn" class="w-full sm:w-auto flex-1 bg-[#58725c] hover:bg-[#49604d] text-white font-medium py-2 px-5 rounded-md text-xs transition-colors shadow-xs">
-            Mulai Analisis
+            Jalankan Analisis Pipeline
           </button>
           <button type="button" id="loadBenchmarkBtn" class="w-full sm:w-auto border border-[#ccd9cc] hover:border-[#b4c7b4] text-[#3d5140] hover:text-[#1e2920] bg-white font-medium py-2 px-4 rounded-md text-xs transition-colors">
-            Gunakan Data Contoh
+            Muat Dataset Benchmark
           </button>
         </div>
 
@@ -175,8 +193,8 @@
           </svg>
         </div>
         <div class="space-y-1">
-          <div class="text-sm font-semibold text-[#1e2920]">Sedang Memproses Data</div>
-          <div class="text-xs text-[#556957]">Menyusun pengelompokan dan saran gizi anak...</div>
+          <div class="text-sm font-semibold text-[#1e2920]">Sedang Menjalankan Pipeline CURE</div>
+          <div class="text-xs text-[#556957]">Klasterisasi titik perwakilan & evaluasi antropometri...</div>
         </div>
         <div class="w-full bg-[#ebf2eb] rounded-full h-1.5 overflow-hidden">
           <div id="progressBar" class="bg-[#58725c] h-1.5 rounded-full transition-all duration-300 w-1/4"></div>
@@ -189,8 +207,8 @@
   <!-- Clean Minimalist Footer -->
   <footer class="border-t border-[#e2eae2] bg-white py-5 text-center text-xs text-[#6e8270] mt-auto">
     <div class="max-w-5xl mx-auto px-6 flex flex-col sm:flex-row items-center justify-between gap-3">
-      <div>StuntSense &middot; Sistem Pemantauan Pertumbuhan & Gizi Balita</div>
-      <div class="text-[11px] text-[#869988]">Standar Antropometri Kemenkes RI</div>
+      <div>CURE-IndoBERT &middot; Stunting Analytics Pipeline</div>
+      <div class="text-[11px] text-[#869988]">Standar Antropometri WHO & Kemenkes RI Permenkes No. 2/2020</div>
     </div>
   </footer>
 
