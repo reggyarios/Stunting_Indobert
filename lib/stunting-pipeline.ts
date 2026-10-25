@@ -4,6 +4,9 @@ export interface ChildRecord {
   [key: string]: any;
   Cluster_ID?: number;
   Cluster_Name?: string;
+  CURE_Cluster_ID?: number;
+  CURE_Cluster_Label?: string;
+  Cluster_Label_Confidence?: number;
   Auto_Label?: string;
   Label_Confidence?: number;
   Clinical_Priority?: string;
@@ -1109,6 +1112,8 @@ export async function processWorkbook(
         ...row,
         Cluster_ID: cid,
         Cluster_Name: clusterName,
+        CURE_Cluster_ID: cid,
+        CURE_Cluster_Label: clusterName,
         Auto_Label: classification.autoLabel,
         Label_Confidence: classification.confidence,
         Clinical_Priority: classification.priority,

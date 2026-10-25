@@ -44,7 +44,7 @@ if HAS_TORCH:
 
 from evaluation import (
     evaluate_classification, evaluate_clustering, compute_silhouette_score,
-    INVALID_PREDICTION_PLACEHOLDERS
+    evaluate_cluster_labeling, INVALID_PREDICTION_PLACEHOLDERS
 )
 from pipeline import (
     normalize_column_name, parse_indonesian_numeric, StuntingResearchPipeline
@@ -268,13 +268,41 @@ class TestPipelineModularStages(unittest.TestCase):
         self.assertTrue(all(l in [0, 1] for l in labels))
 
 
-class TestSyntheticBenchmarkNotice(unittest.TestCase):
-    """Test synthetic benchmark notice and disclaimers."""
+class TestClusterLevelSemanticLabeling(unittest.TestCase):
+    """Test IndoBERT automatic cluster labeling, consensus aggregation, and evaluation."""
 
-    def test_generate_benchmark_docstring_disclaims_real_clinical_data(self):
-        doc = generate_benchmark_stunting_workbook.__doc__
-        self.assertIn("SYNTHETIC DEMONSTRATION", doc)
-        self.assertIn("NOT be described as authentic", doc)
+    def test_uncheckpointed_label_cluster_raises_error(self):
+        """IndoBERTRCNNPipeline without trained checkpoint must raise ModelNotTrainedError."""
+        pipeline = IndoBERTRCNNPipeline(checkpoint_path=None)
+        with self.assertRaises(ModelNotTrainedError):
+            pipeline.label_cluster(["Catatan balita stunting"], cluster_id=0)
+
+    def test_evaluate_cluster_labeling_metrics(self):
+        """Verify cluster-level labeling evaluation against independent ground truth."""
+        cluster_ids = [0, 0, 0, 1, 1, 1]
+        assigned_labels = [
+            "Klaster 0: Stunting Kronis", "Klaster 0: Stunting Kronis", "Klaster 0: Stunting Kronis",
+            "Klaster 1: Pertumbuhan Normal", "Klaster 1: Pertumbuhan Normal", "Klaster 1: Pertumbuhan Normal"
+        ]
+        # Ground truth: cluster 0 has 2 Stunting and 1 Normal (majority Stunting = 66.7% purity)
+        # cluster 1 has 3 Normal (100% purity)
+        ground_truth = ["Stunting", "Stunting", "Normal", "Normal", "Normal", "Normal"]
+
+        res = evaluate_cluster_labeling(cluster_ids, assigned_labels, ground_truth)
+        self.assertEqual(res["status"], "valid")
+        self.assertEqual(res["evaluated_clusters"], 2)
+        self.assertEqual(res["sample_count"], 6)
+
+        c0 = next(p for p in res["cluster_profiles"] if p["cluster_id"] == 0)
+        self.assertEqual(c0["majority_ground_truth"], "Stunting")
+        self.assertAlmostEqual(c0["purity"], 0.6667, places=3)
+
+        c1 = next(p for p in res["cluster_profiles"] if p["cluster_id"] == 1)
+        self.assertEqual(c1["majority_ground_truth"], "Normal")
+        self.assertEqual(c1["purity"], 1.0)
+
+        # Overall purity: (2 + 3) / 6 = 5/6 = 0.8333
+        self.assertAlmostEqual(res["overall_cluster_purity"], 0.8333, places=3)
 
 
 if __name__ == "__main__":

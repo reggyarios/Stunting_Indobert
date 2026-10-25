@@ -336,3 +336,83 @@ def evaluate_clustering(
             result["purity_score"] = round(float(total_purity_matches / valid_n), 4)
 
     return result
+
+
+def evaluate_cluster_labeling(
+    cluster_ids: List[int],
+    assigned_cluster_labels: List[str],
+    ground_truth_labels: List[Union[str, int]]
+) -> Dict[str, Any]:
+    """
+    Evaluate cluster-level semantic labeling against independent ground-truth labels.
+    Explicitly distinguishes clustering evaluation (geometric) from semantic label assignment.
+
+    Parameters
+    ----------
+    cluster_ids : List[int]
+        Cluster IDs assigned by CURE.
+    assigned_cluster_labels : List[str]
+        Semantic cluster labels assigned by IndoBERT to each observation.
+    ground_truth_labels : List[Union[str, int]]
+        Independently observed true reference labels.
+
+    Returns
+    -------
+    Dict containing:
+        - cluster_profiles: majority class and purity for each cluster
+        - overall_cluster_purity: float
+        - sample_count: int
+        - evaluated_clusters: int
+    """
+    if len(cluster_ids) != len(assigned_cluster_labels) or len(cluster_ids) != len(ground_truth_labels):
+        raise ValueError("Length mismatch between cluster_ids, cluster_labels, and ground_truth_labels.")
+
+    N = len(cluster_ids)
+    clean_gt = [str(x).strip() for x in ground_truth_labels]
+    valid_indices = [
+        i for i in range(N)
+        if cluster_ids[i] >= 0 and clean_gt[i].lower() not in INVALID_PREDICTION_PLACEHOLDERS
+    ]
+
+    if not valid_indices:
+        return {
+            "status": "unavailable",
+            "message": "No valid observations with independent ground truth found for cluster labeling evaluation."
+        }
+
+    unique_cids = sorted(list(set(cluster_ids[i] for i in valid_indices)))
+    cluster_evaluation_profiles = []
+    total_majority_matches = 0
+
+    for cid in unique_cids:
+        c_gt = [clean_gt[i] for i in valid_indices if cluster_ids[i] == cid]
+        c_labels = [assigned_cluster_labels[i] for i in valid_indices if cluster_ids[i] == cid]
+        assigned_name = c_labels[0] if c_labels else f"Klaster {cid}"
+
+        gt_counts: Dict[str, int] = {}
+        for g in c_gt:
+            gt_counts[g] = gt_counts.get(g, 0) + 1
+
+        majority_class = max(gt_counts.keys(), key=lambda k: gt_counts[k])
+        majority_count = gt_counts[majority_class]
+        total_majority_matches += majority_count
+        purity = round(float(majority_count / len(c_gt)), 4) if c_gt else 0.0
+
+        cluster_evaluation_profiles.append({
+            "cluster_id": cid,
+            "assigned_cluster_label": assigned_name,
+            "majority_ground_truth": majority_class,
+            "cluster_size": len(c_gt),
+            "purity": purity,
+            "ground_truth_distribution": gt_counts
+        })
+
+    overall_purity = round(float(total_majority_matches / len(valid_indices)), 4)
+
+    return {
+        "status": "valid",
+        "sample_count": len(valid_indices),
+        "evaluated_clusters": len(unique_cids),
+        "overall_cluster_purity": overall_purity,
+        "cluster_profiles": cluster_evaluation_profiles
+    }

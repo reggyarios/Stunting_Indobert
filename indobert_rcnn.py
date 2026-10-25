@@ -666,3 +666,98 @@ class IndoBERTRCNNPipeline:
                 })
 
         return results
+
+    def label_cluster(
+        self,
+        cluster_texts: List[str],
+        cluster_id: int = 0
+    ) -> Dict[str, Any]:
+        """
+        Assign an automatic semantic label to a CURE cluster based on member clinical notes.
+
+        Research Methodology:
+        IndoBERT + RCNN predicts the posterior class probability distribution for each
+        clinical record within the cluster. The cluster semantic label is determined
+        via contextual consensus / mean posterior probability across all cluster members:
+            P_bar(c | Cluster_j) = (1 / |Cluster_j|) * sum_{i in Cluster_j} P(c | text_i)
+            Best_Class = argmax_c P_bar(c | Cluster_j)
+
+        Parameters
+        ----------
+        cluster_texts : List[str]
+            Clinical notes associated with observations in this cluster.
+        cluster_id : int
+            Internal numeric cluster identifier.
+
+        Returns
+        -------
+        Dict containing cluster_id, best_label_id, best_label_key, cluster_label,
+        confidence, consensus_purity, member_count, and class_distribution.
+        """
+        if not self.is_loaded or self.model is None or not self.is_trained:
+            raise ModelNotTrainedError(
+                "IndoBERT + RCNN model checkpoint is not loaded or trained. "
+                "Automatic cluster labeling requires a verified trained checkpoint (.pt file)."
+            )
+
+        valid_texts = [str(t).strip() for t in cluster_texts if str(t).strip()]
+        if not valid_texts:
+            return {
+                "cluster_id": cluster_id,
+                "best_label_id": -1,
+                "best_label_key": "UNLABELED",
+                "cluster_label": f"Klaster {cluster_id}: Catatan Klinis Tidak Tersedia",
+                "confidence": 0.0,
+                "consensus_purity": 0.0,
+                "member_count": len(cluster_texts),
+                "class_distribution": {}
+            }
+
+        predictions = self.predict(valid_texts)
+
+        num_classes = self.num_classes
+        sum_probs = {self.id2label[c]: 0.0 for c in range(num_classes)}
+        vote_counts = {self.id2label[c]: 0 for c in range(num_classes)}
+
+        for pred in predictions:
+            vote_counts[pred["label_key"]] = vote_counts.get(pred["label_key"], 0) + 1
+            for k, prob in pred["probabilities"].items():
+                if k in sum_probs:
+                    sum_probs[k] += prob
+
+        total_valid = len(predictions)
+        mean_probs = {k: v / total_valid for k, v in sum_probs.items()}
+
+        best_label_key = max(mean_probs.keys(), key=lambda k: mean_probs[k])
+        best_label_id = self.label2id.get(best_label_key, 0)
+        best_conf = round(float(mean_probs[best_label_key]), 4)
+        best_desc = DEFAULT_LABEL_DESCRIPTIONS.get(best_label_key, best_label_key)
+
+        consensus_purity = round(float(vote_counts[best_label_key] / total_valid), 4)
+        class_proportions = {
+            k: round(float(cnt / total_valid), 4)
+            for k, cnt in vote_counts.items() if cnt > 0
+        }
+
+        return {
+            "cluster_id": cluster_id,
+            "best_label_id": best_label_id,
+            "best_label_key": best_label_key,
+            "cluster_label": f"Klaster {cluster_id}: {best_desc}",
+            "confidence": best_conf,
+            "consensus_purity": consensus_purity,
+            "member_count": len(cluster_texts),
+            "class_distribution": class_proportions
+        }
+
+    def label_all_clusters(
+        self,
+        cluster_texts_map: Dict[int, List[str]]
+    ) -> Dict[int, Dict[str, Any]]:
+        """
+        Assign semantic labels to all clusters formed by CURE.
+        """
+        result = {}
+        for cid, texts in cluster_texts_map.items():
+            result[cid] = self.label_cluster(texts, cluster_id=cid)
+        return result

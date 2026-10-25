@@ -391,25 +391,57 @@ class StuntingResearchPipeline:
                         s_name, n_complete
                     )
 
-                # IndoBERT + RCNN Inference
+                # Cluster-level semantic labeling via IndoBERT + RCNN (Research Methodology)
+                # Group clinical notes by CURE cluster ID
+                cluster_notes_map: Dict[int, List[str]] = {}
+                for orig_idx, clab in zip(valid_cure_indices, fitted_labels if n_complete >= 2 else []):
+                    cid = int(clab)
+                    if cid not in cluster_notes_map:
+                        cluster_notes_map[cid] = []
+                    cluster_notes_map[cid].append(indicators_list[orig_idx]["notes"])
+
+                cluster_semantic_labels: Dict[int, Dict[str, Any]] = {}
+                cluster_label_map: Dict[int, str] = {}
+                cluster_conf_map: Dict[int, Optional[float]] = {}
+
+                if self.classifier_pipeline and self.classifier_pipeline.is_loaded and self.classifier_pipeline.is_trained:
+                    try:
+                        cluster_semantic_labels = self.classifier_pipeline.label_all_clusters(cluster_notes_map)
+                        for cid, info in cluster_semantic_labels.items():
+                            cluster_label_map[cid] = info["cluster_label"]
+                            cluster_conf_map[cid] = info["confidence"]
+                    except Exception as e:
+                        logger.error("IndoBERT cluster labeling error on sheet %s: %s", s_name, e)
+                        for cid in cluster_notes_map:
+                            cluster_label_map[cid] = f"Klaster {cid} (Error Labeling)"
+                            cluster_conf_map[cid] = None
+                else:
+                    for cid in cluster_notes_map:
+                        cluster_label_map[cid] = f"Klaster {cid} (Label Semantik Belum Dilatih / Checkpoint Tidak Tersedia)"
+                        cluster_conf_map[cid] = None
+
+                # Unclustered / incomplete records
+                cluster_label_map[-1] = "Tidak Terklaster (Data Antropometri Tidak Lengkap)"
+                cluster_conf_map[-1] = None
+
+                # Individual record-level IndoBERT + RCNN inference (distinguished from cluster-level label)
                 notes_texts = [ind["notes"] for ind in indicators_list]
-                indobert_preds: List[str] = []
-                indobert_confs: List[Optional[float]] = []
+                indobert_record_preds: List[str] = []
+                indobert_record_confs: List[Optional[float]] = []
 
                 if self.classifier_pipeline and self.classifier_pipeline.is_loaded and self.classifier_pipeline.is_trained:
                     try:
                         preds = self.classifier_pipeline.predict(notes_texts)
                         for p in preds:
-                            indobert_preds.append(p["label_description"])
-                            indobert_confs.append(p["confidence"])
+                            indobert_record_preds.append(p["label_description"])
+                            indobert_record_confs.append(p["confidence"])
                     except Exception as e:
-                        logger.error("IndoBERT inference error on sheet %s: %s", s_name, e)
-                        indobert_preds = ["Error Inference IndoBERT"] * N
-                        indobert_confs = [None] * N
+                        logger.error("IndoBERT record-level inference error on sheet %s: %s", s_name, e)
+                        indobert_record_preds = ["Error Inference IndoBERT"] * N
+                        indobert_record_confs = [None] * N
                 else:
-                    # Explicit honest status: no fake heuristic predictions
-                    indobert_preds = ["Model Belum Dilatih / Checkpoint Tidak Tersedia"] * N
-                    indobert_confs = [None] * N
+                    indobert_record_preds = ["Model Belum Dilatih / Checkpoint Tidak Tersedia"] * N
+                    indobert_record_confs = [None] * N
 
                 # Permenkes RI No. 2/2020 Standard Anthropometric Categories & Guidelines
                 kemenkes_cats = []
@@ -427,12 +459,14 @@ class StuntingResearchPipeline:
                     medis_list.append(med)
                     monitoring_list.append(mon)
 
-                # Assemble enriched DataFrame without destructively altering raw columns
+                # Assemble enriched DataFrame with explicit separation between Cluster_ID and Cluster_Label
                 df_out = data_rows.copy()
                 df_out["CURE_Cluster_ID"] = cure_labels
+                df_out["CURE_Cluster_Label"] = [cluster_label_map.get(cid, f"Klaster {cid}") for cid in cure_labels]
+                df_out["Cluster_Label_Confidence"] = [cluster_conf_map.get(cid, None) for cid in cure_labels]
+                df_out["IndoBERT_Record_Prediksi"] = indobert_record_preds
+                df_out["IndoBERT_Record_Confidence"] = indobert_record_confs
                 df_out["Kemenkes_Kategori_Gizi"] = kemenkes_cats
-                df_out["IndoBERT_RCNN_Prediksi"] = indobert_preds
-                df_out["IndoBERT_Confidence"] = indobert_confs
                 df_out["Prioritas_Intervensi"] = prioritas_list
                 df_out["Saran_Asupan_Nutrisi"] = nutrisi_list
                 df_out["Tindakan_Medis_Sanitasi"] = medis_list
@@ -444,18 +478,30 @@ class StuntingResearchPipeline:
 
                 classification_eval = None
                 if has_independent_gt and self.classifier_pipeline and self.classifier_pipeline.is_trained:
-                    classification_eval = evaluate_classification(ground_truths, indobert_preds)
+                    classification_eval = evaluate_classification(ground_truths, indobert_record_preds)
 
                 # Write sheet to output
                 sheet_clean_name = s_name[:31]
                 df_out.to_excel(writer, sheet_name=sheet_clean_name, index=False)
+
+                unique_cids = sorted(list(set(l for l in cure_labels if l >= 0)))
+                semantic_summary = [
+                    {
+                        "cluster_id": cid,
+                        "cluster_label": cluster_label_map.get(cid),
+                        "confidence": cluster_conf_map.get(cid),
+                        "size": sum(1 for l in cure_labels if l == cid)
+                    }
+                    for cid in unique_cids
+                ]
 
                 summary = {
                     "sheet_name": s_name,
                     "rows": N,
                     "complete_anthropometric_rows": n_complete,
                     "incomplete_anthropometric_rows": n_incomplete,
-                    "cure_clusters_formed": len(set(l for l in cure_labels if l >= 0)),
+                    "cure_clusters_formed": len(unique_cids),
+                    "cluster_semantic_labels": semantic_summary,
                     "silhouette_score": clustering_eval.get("silhouette_score"),
                     "clustering_eval": clustering_eval,
                     "has_independent_gt": has_independent_gt,
