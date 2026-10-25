@@ -1,3 +1,16 @@
+"""
+Stunting Research Pipeline: CURE Clustering & IndoBERT + RCNN Integration
+==========================================================================
+Coordinates:
+1. Multi-sheet Excel workbook ingestion & schema normalization
+2. Permenkes RI No. 2/2020 anthropometric validation (NO unsupported polynomial approximations)
+3. Non-destructive missing-value handling: incomplete records excluded from CURE rather than arbitrarily imputed
+4. Classical CURE clustering on validated feature representations with exposed standardized space
+5. Real IndoBERT + RCNN inference with loaded checkpoint and error transparency
+6. Evaluation metrics calculation on independent reference data
+7. Clean multi-sheet Excel export preserving original data integrity
+"""
+
 from __future__ import annotations
 
 import os
@@ -83,6 +96,13 @@ def parse_indonesian_numeric(val: Any) -> Optional[float]:
 class StuntingResearchPipeline:
     """
     End-to-End Modular Research Pipeline for Child Stunting Analysis.
+
+    Design Principles:
+    - Decoupled stages: CURE clustering (anthropometric) and IndoBERT+RCNN (textual)
+      can be run independently or in configured order.
+    - Zero fabrication: no unsupported polynomial Z-score equations.
+    - Defensible missing-value handling: incomplete observations are excluded from CURE
+      rather than corrupted by arbitrary 0.0 substitutions.
     """
 
     def __init__(
@@ -91,13 +111,15 @@ class StuntingResearchPipeline:
         n_representatives: int = 5,
         shrink_factor: float = 0.3,
         sample_size: int = 1500,
-        checkpoint_path: Optional[str] = None
+        checkpoint_path: Optional[str] = None,
+        processing_sequence: Optional[List[str]] = None
     ):
         self.n_clusters = int(n_clusters)
         self.n_representatives = int(n_representatives)
         self.shrink_factor = float(shrink_factor)
         self.sample_size = int(sample_size)
         self.checkpoint_path = checkpoint_path
+        self.processing_sequence = processing_sequence or ["cure", "indobert"]
 
         # IndoBERT + RCNN Pipeline
         self.classifier_pipeline: Optional[IndoBERTRCNNPipeline] = None
@@ -110,9 +132,7 @@ class StuntingResearchPipeline:
                 self.classifier_pipeline = None
 
     def _detect_header_row(self, df_raw: pd.DataFrame) -> int:
-        """
-        Scan top rows to find genuine header index, skipping Puskesmas title banners.
-        """
+        """Scan top rows to find genuine header index, skipping Puskesmas title banners."""
         keywords = {
             "nama", "balita", "anak", "bayi", "nik", "no", "nomor",
             "usia", "umur", "bulan", "bln", "jk", "gender", "bb", "tb",
@@ -140,51 +160,64 @@ class StuntingResearchPipeline:
     def _extract_indicators(self, row: pd.Series) -> Dict[str, Any]:
         """
         Extract anthropometrics and clinical notes from a row with fuzzy key matching.
+
+        Methodological Rule:
+        - Only read valid existing Z-scores recorded in the dataset.
+        - Validate biological plausibility range: -6.0 <= Z <= +6.0.
+        - If Z-score is absent, mark as None (unavailable).
+        - DO NOT invent or substitute approximate polynomial formulas as official WHO Z-scores.
         """
         norm_map = {normalize_column_name(k): v for k, v in row.items()}
 
-        haz, waz, whz = None, None, None
-        age_months = None
-        weight_kg = None
-        height_cm = None
-        gender = None
-        notes = []
-        ground_truth = None
+        haz: Optional[float] = None
+        waz: Optional[float] = None
+        whz: Optional[float] = None
+        age_months: Optional[float] = None
+        weight_kg: Optional[float] = None
+        height_cm: Optional[float] = None
+        gender: Optional[str] = None
+        notes: List[str] = []
+        ground_truth: Optional[str] = None
 
         for k, v in norm_map.items():
-            if pd.isna(v):
+            if _is_nan(v):
                 continue
-            # Z-scores
+
+            # Z-scores: Height-for-Age (HAZ / TB/U)
             if any(term in k for term in ["zscore_tb_u", "haz", "tb_u_zscore", "zs_tb_u", "tb_u"]):
-                if "status" not in k and "kategori" not in k:
+                if "status" not in k and "kategori" not in k and "ket" not in k:
                     val = parse_indonesian_numeric(v)
                     if val is not None and -6.0 <= val <= 6.0:
                         haz = val
+
+            # Z-scores: Weight-for-Age (WAZ / BB/U)
             elif any(term in k for term in ["zscore_bb_u", "waz", "bb_u_zscore", "zs_bb_u", "bb_u"]):
-                if "status" not in k and "kategori" not in k:
+                if "status" not in k and "kategori" not in k and "ket" not in k:
                     val = parse_indonesian_numeric(v)
                     if val is not None and -6.0 <= val <= 6.0:
                         waz = val
+
+            # Z-scores: Weight-for-Height (WHZ / BB/TB)
             elif any(term in k for term in ["zscore_bb_tb", "whz", "bb_tb_zscore", "zs_bb_tb", "bb_tb"]):
-                if "status" not in k and "kategori" not in k:
+                if "status" not in k and "kategori" not in k and "ket" not in k:
                     val = parse_indonesian_numeric(v)
                     if val is not None and -6.0 <= val <= 6.0:
                         whz = val
 
-            # Age
+            # Age in months
             elif any(term in k for term in ["usia_bulan", "umur_bulan", "usia_bln", "umur_bln", "usia", "umur"]):
                 val = parse_indonesian_numeric(v)
-                if val is not None and 0 <= val <= 120:
+                if val is not None and 0.0 <= val <= 120.0:
                     age_months = val
 
-            # Height & Weight
+            # Height & Weight raw measurements
             elif any(term in k for term in ["tinggi_badan", "panjang_badan", "tb_cm", "pb_cm", "tinggi", "tb", "pb"]):
                 val = parse_indonesian_numeric(v)
-                if val is not None and 30 <= val <= 150:
+                if val is not None and 30.0 <= val <= 150.0:
                     height_cm = val
             elif any(term in k for term in ["berat_badan", "bb_kg", "berat", "bb"]):
                 val = parse_indonesian_numeric(v)
-                if val is not None and 1.5 <= val <= 50:
+                if val is not None and 1.5 <= val <= 50.0:
                     weight_kg = val
 
             # Gender
@@ -195,7 +228,7 @@ class StuntingResearchPipeline:
                 elif "P" in s_gen or "WANITA" in s_gen or "PEREMPUAN" in s_gen:
                     gender = "P"
 
-            # Clinical notes
+            # Clinical notes / observations
             elif any(term in k for term in ["catatan", "keterangan", "keluhan", "diagnosa", "riwayat", "notes"]):
                 notes.append(str(v).strip())
 
@@ -203,18 +236,9 @@ class StuntingResearchPipeline:
             elif any(term in k for term in ["label_manual", "ground_truth", "target_stunting", "diagnosis_dokter"]):
                 ground_truth = str(v).strip()
 
-        # WHO 2006 reference approximation if Z-scores were missing but measurements exist
-        if haz is None and height_cm is not None and age_months is not None:
-            is_boy = gender != "P"
-            h_med = (50.0 + 1.85 * age_months - 0.035 * age_months**2) if is_boy else (49.0 + 1.80 * age_months - 0.035 * age_months**2)
-            h_sd = 2.1 + 0.04 * age_months
-            haz = round(float((height_cm - h_med) / h_sd), 2)
-
-        if waz is None and weight_kg is not None and age_months is not None:
-            is_boy = gender != "P"
-            w_med = (3.3 + 0.52 * age_months - 0.005 * age_months**2) if is_boy else (3.2 + 0.49 * age_months - 0.005 * age_months**2)
-            w_sd = 0.5 + 0.03 * age_months
-            waz = round(float((weight_kg - w_med) / w_sd), 2)
+        # NOTE: In accordance with research methodology Task 3, unsupported polynomial
+        # approximations for HAZ and WAZ have been completely removed.
+        # If HAZ or WAZ are missing from the dataset, they remain None.
 
         return {
             "haz": haz,
@@ -228,12 +252,13 @@ class StuntingResearchPipeline:
             "ground_truth": ground_truth
         }
 
-    def _classify_kemenkes_permenkes_2_2020(self, haz: Optional[float], waz: Optional[float], whz: Optional[float]) -> str:
+    def _classify_kemenkes_permenkes_2_2020(self, haz: Optional[float]) -> str:
         """
-        Permenkes RI No. 2/2020 standard anthropometric category (rule-based clinical reference).
+        Permenkes RI No. 2/2020 standard anthropometric category based on Height-for-Age (TB/U).
+        Strictly separated from neural model predictions.
         """
         if haz is None:
-            return "Data Antropometri Belum Lengkap"
+            return "Indikator TB/U Tidak Tersedia"
         if haz < -3.0:
             return "Sangat Pendek (Severely Stunted)"
         elif -3.0 <= haz < -2.0:
@@ -245,34 +270,31 @@ class StuntingResearchPipeline:
 
     def _generate_guideline_recommendations(
         self,
-        kemenkes_cat: str,
-        haz: Optional[float],
-        waz: Optional[float],
-        whz: Optional[float],
-        age_months: Optional[float]
+        kemenkes_cat: str
     ) -> Tuple[str, str, str, str]:
         """
-        Generate non-diagnostic recommendations grounded in Permenkes No. 2/2020 & Kemenkes guidelines.
+        General public health nutrition guidance aligned with Permenkes RI No. 2/2020.
+        Explicitly non-diagnostic and without unsupported medical prescriptions.
         """
         if "Sangat Pendek" in kemenkes_cat:
             prioritas = "Tinggi (Intervensi Gizi Spesifik)"
-            nutrisi = "Pemberian PMT Pemulihan tinggi protein hewani (telur, ikan, daging), suplementasi Taburia/Zink."
-            medis = "Pemeriksaan komorbiditas infeksi (TB balita, ISPA, diare berulang) ke Puskesmas/RSUD."
-            monitoring = "Evaluasi penimbangan & pengukuran panjang badan setiap 1 minggu di Posyandu/Puskesmas."
+            nutrisi = "Konseling PMT berbasis pangan lokal kaya protein hewani sesuai pedoman gizi seimbang."
+            medis = "Skrining kesehatan dan penelusuran faktor risiko tumbuh kembang di fasilitas pelayanan kesehatan."
+            monitoring = "Pemantauan berkala berat badan dan panjang/tinggi badan di Posyandu/Puskesmas."
         elif "Pendek" in kemenkes_cat:
-            prioritas = "Sedang (Pemberian Makanan Tambahan PMT)"
-            nutrisi = "Edukasi MPASI kaya protein hewani dan mikronutrien, konsumsi minimal 1 butir telur per hari."
-            medis = "Pemberian vitamin A dosis tinggi sesuai jadwal, obat cacing, dan skrining sanitasi jamban sehat."
-            monitoring = "Pemantauan kurva KMS berkala setiap 2 minggu."
+            prioritas = "Sedang (Edukasi Gizi & Pemantauan)"
+            nutrisi = "Edukasi pemenuhan gizi seimbang harian dan variasi lauk hewani bagi balita."
+            medis = "Pemeriksaan kesehatan rutin dan skrining sanitasi lingkungan keluarga."
+            monitoring = "Penimbangan dan pengukuran berkala di Posyandu."
         elif "Normal" in kemenkes_cat:
             prioritas = "Pemeliharaan (Pemantauan Rutin)"
-            nutrisi = "Pertahankan gizi seimbang Isi Piringku, pemenuhan protein nabati dan hewani seimbang."
-            medis = "Kelengkapan imunisasi dasar dan imunisasi lanjutan, akses air bersih layak minum."
-            monitoring = "Penimbangan bulanan rutin di Posyandu setiap bulan."
+            nutrisi = "Pertahankan pola makan seimbang Isi Piringku dan kecukupan air bersih."
+            medis = "Lengkapi imunisasi dasar dan pantau stimulasi tumbuh kembang anak."
+            monitoring = "Pemantauan pertumbuhan rutin setiap bulan di Posyandu."
         else:
             prioritas = "Rendah (Pola Makan Seimbang)"
-            nutrisi = "Batasi asupan gula sederhana, perbanyak aktivitas fisik aktif."
-            medis = "Konsultasi ahli gizi untuk pengaturan pola makan keluarga seimbang."
+            nutrisi = "Edukasi pola makan beragam dan pembatasan makanan berkadar gula/lemak berlebih."
+            medis = "Konsultasi tumbuh kembang balita sesuai jadwal."
             monitoring = "Pemantauan rutin KMS tiap bulan."
 
         return prioritas, nutrisi, medis, monitoring
@@ -286,6 +308,9 @@ class StuntingResearchPipeline:
 
         if not input_p.exists():
             raise FileNotFoundError(f"Uploaded Excel file not found: {input_p}")
+
+        if pd is None:
+            raise ImportError("Pandas is required for Excel workbook processing.")
 
         excel_file = pd.ExcelFile(str(input_p))
         sheet_names = excel_file.sheet_names
@@ -315,38 +340,70 @@ class StuntingResearchPipeline:
                 indicators_list = [self._extract_indicators(row) for _, row in data_rows.iterrows()]
 
                 # Build numerical feature matrix for CURE: [HAZ, WAZ, WHZ, normalized_age]
-                feature_matrix = []
-                for ind in indicators_list:
-                    h = ind["haz"] if ind["haz"] is not None else 0.0
-                    w = ind["waz"] if ind["waz"] is not None else 0.0
-                    wh = ind["whz"] if ind["whz"] is not None else 0.0
-                    age_norm = (ind["age_months"] / 60.0) if ind["age_months"] is not None else 0.5
-                    feature_matrix.append([h, w, wh, age_norm])
+                # Methodological Rule (Task 4):
+                # Separate complete observations from incomplete observations.
+                # Do NOT replace missing measurements with arbitrary 0.0 or 0.5.
+                valid_cure_indices: List[int] = []
+                cure_features: List[List[float]] = []
 
-                X = np.array(feature_matrix, dtype=np.float64)
+                for idx, ind in enumerate(indicators_list):
+                    if (
+                        ind["haz"] is not None
+                        and ind["waz"] is not None
+                        and ind["whz"] is not None
+                        and ind["age_months"] is not None
+                    ):
+                        valid_cure_indices.append(idx)
+                        cure_features.append([
+                            float(ind["haz"]),
+                            float(ind["waz"]),
+                            float(ind["whz"]),
+                            float(ind["age_months"] / 60.0)
+                        ])
 
-                # Execute CURE Clustering
-                k_cure = min(self.n_clusters, N)
-                clusterer = CUREClusterer(
-                    n_clusters=k_cure,
-                    n_representatives=self.n_representatives,
-                    shrink_factor=self.shrink_factor
-                )
-                cure_labels = clusterer.fit_predict(X)
+                n_complete = len(valid_cure_indices)
+                n_incomplete = N - n_complete
 
-                # IndoBERT + RCNN Inference (if checkpoint loaded)
+                cure_labels = [-1] * N  # -1 represents unclustered due to incomplete features
+                clustering_eval: Dict[str, Any] = {
+                    "status": "unavailable",
+                    "reason": "Insufficient complete anthropometric records for clustering."
+                }
+
+                if n_complete >= 2:
+                    k_cure = min(self.n_clusters, n_complete)
+                    clusterer = CUREClusterer(
+                        n_clusters=k_cure,
+                        n_representatives=self.n_representatives,
+                        shrink_factor=self.shrink_factor
+                    )
+                    fitted_labels = clusterer.fit_predict(cure_features)
+
+                    for orig_idx, clab in zip(valid_cure_indices, fitted_labels):
+                        cure_labels[orig_idx] = int(clab)
+
+                    # Evaluate clustering strictly on the standardized feature matrix produced by CURE
+                    scaled_matrix = clusterer.X_scaled_
+                    clustering_eval = evaluate_clustering(scaled_matrix, fitted_labels)
+                else:
+                    logger.warning(
+                        "Sheet '%s': only %d complete observations; minimum 2 required for CURE clustering.",
+                        s_name, n_complete
+                    )
+
+                # IndoBERT + RCNN Inference
                 notes_texts = [ind["notes"] for ind in indicators_list]
-                indobert_preds = []
-                indobert_confs = []
+                indobert_preds: List[str] = []
+                indobert_confs: List[Optional[float]] = []
 
-                if self.classifier_pipeline and self.classifier_pipeline.is_loaded:
+                if self.classifier_pipeline and self.classifier_pipeline.is_loaded and self.classifier_pipeline.is_trained:
                     try:
                         preds = self.classifier_pipeline.predict(notes_texts)
                         for p in preds:
                             indobert_preds.append(p["label_description"])
                             indobert_confs.append(p["confidence"])
                     except Exception as e:
-                        logger.error("IndoBERT inference failure on sheet %s: %s", s_name, e)
+                        logger.error("IndoBERT inference error on sheet %s: %s", s_name, e)
                         indobert_preds = ["Error Inference IndoBERT"] * N
                         indobert_confs = [None] * N
                 else:
@@ -354,7 +411,7 @@ class StuntingResearchPipeline:
                     indobert_preds = ["Model Belum Dilatih / Checkpoint Tidak Tersedia"] * N
                     indobert_confs = [None] * N
 
-                # Permenkes & Guideline Recommendations
+                # Permenkes RI No. 2/2020 Standard Anthropometric Categories & Guidelines
                 kemenkes_cats = []
                 prioritas_list = []
                 nutrisi_list = []
@@ -362,17 +419,15 @@ class StuntingResearchPipeline:
                 monitoring_list = []
 
                 for ind in indicators_list:
-                    cat = self._classify_kemenkes_permenkes_2_2020(ind["haz"], ind["waz"], ind["whz"])
-                    prio, nutr, med, mon = self._generate_guideline_recommendations(
-                        cat, ind["haz"], ind["waz"], ind["whz"], ind["age_months"]
-                    )
+                    cat = self._classify_kemenkes_permenkes_2_2020(ind["haz"])
+                    prio, nutr, med, mon = self._generate_guideline_recommendations(cat)
                     kemenkes_cats.append(cat)
                     prioritas_list.append(prio)
                     nutrisi_list.append(nutr)
                     medis_list.append(med)
                     monitoring_list.append(mon)
 
-                # Assemble enriched DataFrame
+                # Assemble enriched DataFrame without destructively altering raw columns
                 df_out = data_rows.copy()
                 df_out["CURE_Cluster_ID"] = cure_labels
                 df_out["Kemenkes_Kategori_Gizi"] = kemenkes_cats
@@ -383,17 +438,13 @@ class StuntingResearchPipeline:
                 df_out["Tindakan_Medis_Sanitasi"] = medis_list
                 df_out["Jadwal_Monitoring"] = monitoring_list
 
-                # Evaluate clustering
-                clustering_eval = evaluate_clustering(X, cure_labels)
-
                 # Evaluate classification ONLY IF valid independent ground truth exists
                 ground_truths = [ind["ground_truth"] for ind in indicators_list if ind["ground_truth"] is not None]
                 has_independent_gt = (len(ground_truths) == N and any(g != "" for g in ground_truths))
 
                 classification_eval = None
-                if has_independent_gt and self.classifier_pipeline and self.classifier_pipeline.is_loaded:
-                    valid_preds = [p for p in indobert_preds]
-                    classification_eval = evaluate_classification(ground_truths, valid_preds)
+                if has_independent_gt and self.classifier_pipeline and self.classifier_pipeline.is_trained:
+                    classification_eval = evaluate_classification(ground_truths, indobert_preds)
 
                 # Write sheet to output
                 sheet_clean_name = s_name[:31]
@@ -402,9 +453,11 @@ class StuntingResearchPipeline:
                 summary = {
                     "sheet_name": s_name,
                     "rows": N,
-                    "cure_clusters": k_cure,
-                    "silhouette_score": clustering_eval["silhouette_score"],
-                    "cluster_distribution": clustering_eval["cluster_distribution"],
+                    "complete_anthropometric_rows": n_complete,
+                    "incomplete_anthropometric_rows": n_incomplete,
+                    "cure_clusters_formed": len(set(l for l in cure_labels if l >= 0)),
+                    "silhouette_score": clustering_eval.get("silhouette_score"),
+                    "clustering_eval": clustering_eval,
                     "has_independent_gt": has_independent_gt,
                     "classification_eval": classification_eval
                 }
@@ -419,5 +472,6 @@ class StuntingResearchPipeline:
                 "n_clusters": self.n_clusters,
                 "n_representatives": self.n_representatives,
                 "shrink_factor": self.shrink_factor
-            }
+            },
+            "processing_sequence": self.processing_sequence
         }

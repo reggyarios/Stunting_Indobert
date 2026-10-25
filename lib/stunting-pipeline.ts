@@ -447,24 +447,8 @@ export function extractChildIndicators(record: Record<string, any>, sheetName: s
     else if (sLower.includes('gizi lebih') || sLower.includes('obesitas')) whz = 2.2;
   }
 
-  // Compute WHO 2006 Standard Z-scores if anthropometrics are present but Z-scores were absent
-  if (haz === null && heightCm !== null && ageMonths !== null) {
-    const isBoy = gender !== 'P';
-    const hMed = isBoy
-      ? (ageMonths <= 24 ? 50.0 + 1.85 * ageMonths - 0.035 * ageMonths * ageMonths : 87.8 + 0.65 * (ageMonths - 24))
-      : (ageMonths <= 24 ? 49.0 + 1.80 * ageMonths - 0.035 * ageMonths * ageMonths : 86.5 + 0.63 * (ageMonths - 24));
-    const hSd = 2.1 + 0.04 * ageMonths;
-    haz = Math.round(((heightCm - hMed) / hSd) * 100) / 100;
-  }
-
-  if (waz === null && weightKg !== null && ageMonths !== null) {
-    const isBoy = gender !== 'P';
-    const wMed = isBoy
-      ? (ageMonths <= 24 ? 3.3 + 0.52 * ageMonths - 0.005 * ageMonths * ageMonths : 12.2 + 0.18 * (ageMonths - 24))
-      : (ageMonths <= 24 ? 3.2 + 0.49 * ageMonths - 0.005 * ageMonths * ageMonths : 11.5 + 0.17 * (ageMonths - 24));
-    const wSd = 0.5 + 0.03 * ageMonths;
-    waz = Math.round(((weightKg - wMed) / wSd) * 100) / 100;
-  }
+  // Note: Unsupported polynomial approximations for HAZ and WAZ have been removed
+  // in accordance with research methodology. Missing Z-scores remain null.
 
   return {
     childName,
@@ -1017,22 +1001,38 @@ export async function processWorkbook(
     const indicatorsList = rawData.map(row => extractChildIndicators(row, sheetName));
 
     // 2. Construct 4-dimensional bounded feature matrix for CURE clustering
-    const featureMatrix: number[][] = indicatorsList.map((ind, idx) => {
-      const hazVal = ind.haz !== null ? ind.haz : (ind.heightCm ? Math.max(-5, Math.min(5, (ind.heightCm - 75) / 10)) : -0.5);
-      const wazVal = ind.waz !== null ? ind.waz : (ind.weightKg ? Math.max(-5, Math.min(5, (ind.weightKg - 10) / 2)) : -0.5);
-      const whzVal = ind.whz !== null ? ind.whz : 0.0;
-      const ageVal = ind.ageMonths !== null ? ind.ageMonths : ((idx * 7) % 48) + 6;
-      return [hazVal, wazVal, whzVal, Math.min(72, ageVal) / 60];
+    // Research methodology: Only complete anthropometric records are clustered with CURE.
+    // Incomplete records are not arbitrarily imputed.
+    const validCureIndices: number[] = [];
+    const featureMatrix: number[][] = [];
+
+    indicatorsList.forEach((ind, idx) => {
+      if (ind.haz !== null && ind.waz !== null && ind.whz !== null && ind.ageMonths !== null) {
+        validCureIndices.push(idx);
+        featureMatrix.push([
+          ind.haz,
+          ind.waz,
+          ind.whz,
+          Math.min(72, ind.ageMonths) / 60
+        ]);
+      }
     });
 
-    const { labels } = cure.fitPredict(featureMatrix);
+    const labels: number[] = new Array(rawData.length).fill(-1);
+    if (featureMatrix.length >= 2) {
+      const { labels: fitted } = cure.fitPredict(featureMatrix);
+      validCureIndices.forEach((origIdx, fIdx) => {
+        labels[origIdx] = fitted[fIdx] ?? 0;
+      });
+    }
 
-    // Compute cluster anthropometric averages (HAZ, WAZ, WHZ) to provide rich clinical cluster names
+    // Compute cluster anthropometric averages
     const clusterHazSums: Record<number, number[]> = {};
     const clusterWazSums: Record<number, number[]> = {};
     const clusterWhzSums: Record<number, number[]> = {};
     for (let i = 0; i < rawData.length; i++) {
-      const cid = labels[i] ?? 0;
+      const cid = labels[i];
+      if (cid < 0) continue;
       if (!clusterHazSums[cid]) clusterHazSums[cid] = [];
       if (!clusterWazSums[cid]) clusterWazSums[cid] = [];
       if (!clusterWhzSums[cid]) clusterWhzSums[cid] = [];

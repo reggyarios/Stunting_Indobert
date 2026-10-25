@@ -5,9 +5,12 @@ Provides rigorous mathematical evaluation:
 1. Classification Metrics: Accuracy, Precision (Macro/Weighted), Recall (Macro/Weighted),
    F1-Score (Macro/Weighted), and Confusion Matrix.
    Strict requirement: Only computed when independent, verified ground-truth labels exist.
+   Rejects error placeholders or self-evaluations.
 2. Clustering Metrics: Silhouette Score, Cluster Purity, and Distribution Summaries.
-3. Dual-mode support: Seamlessly executes with NumPy or pure Python standard library.
+   Uses the exact standardized feature matrix produced by CURE.
 """
+
+from __future__ import annotations
 
 import math
 from typing import Dict, List, Any, Optional, Union
@@ -20,6 +23,19 @@ except ImportError:
     np = None
 
 
+# Placeholders or error strings that must never be evaluated as genuine model classes
+INVALID_PREDICTION_PLACEHOLDERS = {
+    "model belum dilatih / checkpoint tidak tersedia",
+    "checkpoint tidak tersedia (belum dilatih)",
+    "error inference indobert",
+    "unspecified",
+    "none",
+    "nan",
+    "null",
+    ""
+}
+
+
 def evaluate_classification(
     y_true: List[Union[str, int]],
     y_pred: List[Union[str, int]],
@@ -28,15 +44,11 @@ def evaluate_classification(
     """
     Evaluate multi-class classification against independent ground truth.
 
-    Parameters
-    ----------
-    y_true : list of true reference labels (must be independently observed)
-    y_pred : list of model predictions
-    labels : optional explicit class order
-
-    Returns
-    -------
-    dict containing accuracy, precision, recall, f1, and confusion matrix.
+    Requirements:
+    - Never evaluates self-generated predictions as ground truth.
+    - Excludes invalid placeholders (e.g. 'Model Belum Dilatih').
+    - Reports valid evaluated count vs excluded count.
+    - Multi-class Macro and Weighted Precision, Recall, F1, and Confusion Matrix.
     """
     if len(y_true) == 0 or len(y_pred) == 0:
         return {
@@ -44,21 +56,63 @@ def evaluate_classification(
             "message": "Empty label arrays provided."
         }
 
+    # Detect fraudulent self-evaluation (identical array passed as true and pred)
+    if y_true is y_pred:
+        return {
+            "status": "invalid_self_evaluation",
+            "message": "Model-generated predictions cannot be evaluated against themselves as ground truth."
+        }
+
     if len(y_true) != len(y_pred):
-        raise ValueError(f"Length mismatch: len(y_true)={len(y_true)} vs len(y_pred)={len(y_pred)}")
+        raise ValueError(
+            f"Length mismatch: len(y_true)={len(y_true)} vs len(y_pred)={len(y_pred)}"
+        )
 
-    y_t = [str(x).strip() for x in y_true]
-    y_p = [str(x).strip() for x in y_pred]
-    num_samples = len(y_t)
+    # Filter out invalid placeholders or ungrounded predictions
+    clean_trues: List[str] = []
+    clean_preds: List[str] = []
+    excluded_count = 0
 
-    # Unique classes
-    unique_set = set(y_t).union(set(y_p))
+    for yt, yp in zip(y_true, y_pred):
+        st_yt = str(yt).strip()
+        st_yp = str(yp).strip()
+        lower_yp = st_yp.lower()
+
+        if lower_yp in INVALID_PREDICTION_PLACEHOLDERS or not st_yt or st_yt.lower() in INVALID_PREDICTION_PLACEHOLDERS:
+            excluded_count += 1
+            continue
+
+        clean_trues.append(st_yt)
+        clean_preds.append(st_yp)
+
+    if len(clean_trues) == 0:
+        return {
+            "status": "unavailable",
+            "message": "No valid evaluated observations with independent ground truth found.",
+            "total_samples": len(y_true),
+            "excluded_samples": excluded_count
+        }
+
+    num_samples = len(clean_trues)
+
+    # Detect fraudulent self-evaluation (identical pointer/list passed)
+    if clean_trues is clean_preds:
+        return {
+            "status": "invalid_self_evaluation",
+            "message": "Model-generated predictions cannot be evaluated against themselves as ground truth."
+        }
+
+    unique_set = set(clean_trues).union(set(clean_preds))
     if labels is not None:
         unique_classes = [str(l).strip() for l in labels if str(l).strip() in unique_set]
+        # Append any remaining classes
+        for c in sorted(list(unique_set)):
+            if c not in unique_classes:
+                unique_classes.append(c)
     else:
         unique_classes = sorted(list(unique_set))
 
-    correct_count = sum(1 for yt, yp in zip(y_t, y_p) if yt == yp)
+    correct_count = sum(1 for yt, yp in zip(clean_trues, clean_preds) if yt == yp)
     accuracy = float(correct_count / num_samples)
 
     # Confusion matrix
@@ -66,7 +120,7 @@ def evaluate_classification(
     class_to_idx = {c: i for i, c in enumerate(unique_classes)}
     cm = [[0 for _ in range(n_c)] for _ in range(n_c)]
 
-    for yt, yp in zip(y_t, y_p):
+    for yt, yp in zip(clean_trues, clean_preds):
         if yt in class_to_idx and yp in class_to_idx:
             cm[class_to_idx[yt]][class_to_idx[yp]] += 1
 
@@ -111,6 +165,7 @@ def evaluate_classification(
     return {
         "status": "valid",
         "sample_count": num_samples,
+        "excluded_count": excluded_count,
         "classes": unique_classes,
         "accuracy": round(accuracy, 4),
         "macro_avg": {
@@ -135,9 +190,9 @@ def _vec_dist(p1: List[float], p2: List[float]) -> float:
 def compute_silhouette_score(X: Any, labels: Any) -> Optional[float]:
     """
     Calculate the Silhouette Coefficient for cluster validation.
+    Must be computed on the exact standardized feature matrix used by CURE.
     Returns float in [-1, 1], or None if cannot be computed.
     """
-    # Convert input to list of lists
     if HAS_NUMPY and isinstance(X, np.ndarray):
         rows = X.tolist()
     else:
@@ -150,15 +205,17 @@ def compute_silhouette_score(X: Any, labels: Any) -> Optional[float]:
 
     N = len(rows)
     unique_labels = sorted(list(set(labs)))
+    # Exclude noise / unassigned cluster ID (-1)
+    unique_labels = [l for l in unique_labels if l >= 0]
     k = len(unique_labels)
 
     if k <= 1 or k >= N:
         return None
 
-    # Subsample if N > 300 for speed
-    if N > 300:
-        step = N / 300
-        indices = [int(i * step) for i in range(300)]
+    # Subsample if N > 400 for responsiveness and reproducibility
+    if N > 400:
+        step = N / 400
+        indices = [int(i * step) for i in range(400)]
         sub_rows = [rows[i] for i in indices]
         sub_labs = [labs[i] for i in indices]
     else:
@@ -170,6 +227,8 @@ def compute_silhouette_score(X: Any, labels: Any) -> Optional[float]:
 
     for i in range(n_sub):
         ci = sub_labs[i]
+        if ci < 0:
+            continue
         same_indices = [idx for idx, l in enumerate(sub_labs) if l == ci and idx != i]
         if len(same_indices) == 0:
             s_vals.append(0.0)
@@ -198,17 +257,17 @@ def compute_silhouette_score(X: Any, labels: Any) -> Optional[float]:
 
 
 def evaluate_clustering(
-    X: Any,
+    X_scaled: Any,
     labels: Any,
     ground_truth_labels: Optional[List[Any]] = None
 ) -> Dict[str, Any]:
     """
-    Evaluate cluster structure, separation, and purity.
+    Evaluate cluster separation and profile distributions on standardized CURE feature space.
     """
-    if HAS_NUMPY and isinstance(X, np.ndarray):
-        rows = X.tolist()
+    if HAS_NUMPY and isinstance(X_scaled, np.ndarray):
+        rows = X_scaled.tolist()
     else:
-        rows = [[float(v) for v in r] for r in X]
+        rows = [[float(v) for v in r] for r in X_scaled]
 
     if HAS_NUMPY and isinstance(labels, np.ndarray):
         labs = labels.tolist()
@@ -218,20 +277,20 @@ def evaluate_clustering(
     N = len(rows)
     D = len(rows[0]) if N > 0 else 0
     unique_labels = sorted(list(set(labs)))
-    k = len(unique_labels)
+    valid_clusters = [l for l in unique_labels if l >= 0]
+    k = len(valid_clusters)
 
     sil_score = compute_silhouette_score(rows, labs)
 
-    # Cluster sizes & proportions
     cluster_counts = {int(c): sum(1 for l in labs if l == c) for c in unique_labels}
     cluster_percentages = {
         int(c): round(float(count / max(1, N) * 100), 2)
         for c, count in cluster_counts.items()
     }
 
-    # Cluster centroids and spread
+    # Cluster profiles in standardized space
     cluster_profiles = []
-    for c in unique_labels:
+    for c in valid_clusters:
         c_pts = [rows[i] for i in range(N) if labs[i] == c]
         if len(c_pts) > 0:
             cent = [sum(pt[j] for pt in c_pts) / len(c_pts) for j in range(D)]
@@ -248,26 +307,32 @@ def evaluate_clustering(
         cluster_profiles.append(profile)
 
     result: Dict[str, Any] = {
+        "status": "valid" if k >= 2 else "insufficient_clusters",
         "num_clusters": k,
         "sample_count": N,
         "silhouette_score": sil_score,
+        "silhouette_interpretation": (
+            "Silhouette score reflects geometric partition separation in standardized "
+            "anthropometric feature space and does not constitute clinical proof."
+        ),
         "cluster_distribution": cluster_counts,
         "cluster_percentages": cluster_percentages,
         "cluster_profiles": cluster_profiles
     }
 
-    # Purity score if ground truth is available
     if ground_truth_labels is not None and len(ground_truth_labels) == N:
         gt = [str(x).strip() for x in ground_truth_labels]
         total_purity_matches = 0
-        for c in unique_labels:
-            c_gt = [gt[i] for i in range(N) if labs[i] == c]
+        valid_n = 0
+        for c in valid_clusters:
+            c_gt = [gt[i] for i in range(N) if labs[i] == c and gt[i].lower() not in INVALID_PREDICTION_PLACEHOLDERS]
             if len(c_gt) > 0:
+                valid_n += len(c_gt)
                 counts: Dict[str, int] = {}
                 for item in c_gt:
                     counts[item] = counts.get(item, 0) + 1
                 total_purity_matches += max(counts.values())
-        purity = float(total_purity_matches / max(1, N))
-        result["purity_score"] = round(purity, 4)
+        if valid_n > 0:
+            result["purity_score"] = round(float(total_purity_matches / valid_n), 4)
 
     return result

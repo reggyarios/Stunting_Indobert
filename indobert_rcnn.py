@@ -2,26 +2,29 @@
 IndoBERT + RCNN Neural Architecture for Child Stunting Classification
 ====================================================================
 Architecture Specification:
-1. Contextual Representation: IndoBERT (indobenchmark/indobert-base-p1 or bert-base-multilingual-cased)
+1. Contextual Representation: IndoBERT (indobenchmark/indobert-base-p1 or configurable BERT backbone)
    extracting 768-dimensional token hidden states.
-2. Recurrent Component: Bidirectional LSTM / GRU capturing forward and backward clinical narrative dependencies.
-3. Convolutional Component: 1D Convolution with adaptive max-pooling to extract salient local n-gram clinical features.
+2. Recurrent Component: Bidirectional LSTM capturing sequential narrative dependencies.
+3. Convolutional Component: 1D Convolution with attention-masked max-pooling to eliminate padding bias.
 4. Classification Head: Multi-layer perceptron with Dropout and Softmax output.
-5. Checkpoint Persistence: Full state_dict, label mapping, and hyperparameter checkpointing.
-6. Error Transparency: Raises ModelNotTrainedError when uncheckpointed, eliminating silent heuristic fallbacks.
+5. Configurable Taxonomy: Target classes configurable to match study operational definitions.
+6. Validation & Leakage Prevention: Stratified train/val/test splitting, deduplication, and best checkpoint selection.
+7. Error Transparency: Raises ModelNotTrainedError when uncheckpointed, eliminating silent heuristic fallbacks.
 """
 
 from __future__ import annotations
 
 import os
 import sys
+import math
 import logging
+import random
 from pathlib import Path
 from typing import List, Dict, Tuple, Optional, Any, Union
 
 logger = logging.getLogger("IndoBERT_RCNN")
 
-# Canonical clinical stunting taxonomy (Permenkes No. 2/2020 & WHO 2006)
+# Default study research taxonomy (Configurable to study operational definitions)
 DEFAULT_LABEL2ID: Dict[str, int] = {
     "STUNTING_BERAT_KOMORBID": 0,
     "STUNTING_KRONIS": 1,
@@ -83,7 +86,7 @@ if HAS_TORCH:
         - IndoBERT Transformer Encoder (768 dim)
         - Bidirectional LSTM (hidden_dim=256 -> 512 total bidirectional)
         - 1D Convolution (in_channels=768+512=1280, out_channels=256, kernel_size=3, padding=1)
-        - Max-Over-Time Pooling
+        - Attention-Masked Max-Over-Time Pooling (eliminates padding token influence)
         - Dense Classification Head: Linear(256, 128) -> ReLU -> Dropout(0.3) -> Linear(128, num_classes)
         """
 
@@ -107,7 +110,6 @@ if HAS_TORCH:
             if HAS_TRANSFORMERS and AutoModel is not None:
                 self.bert = AutoModel.from_pretrained(pretrained_model_name)
                 bert_dim = self.bert.config.hidden_size
-                # Optionally freeze lower BERT layers for efficient training
                 if freeze_bert_layers > 0 and hasattr(self.bert, "encoder"):
                     for layer in self.bert.encoder.layer[:freeze_bert_layers]:
                         for param in layer.parameters():
@@ -125,7 +127,7 @@ if HAS_TORCH:
                 batch_first=True
             )
 
-            # Combined representation: [left_context; word_embedding; right_context]
+            # Combined representation: [token_embedding; lstm_context]
             combined_dim = bert_dim + (2 * hidden_dim)
 
             # Convolutional component: 1D CNN over combined representations
@@ -149,17 +151,7 @@ if HAS_TORCH:
             bert_embeddings: Optional[torch.Tensor] = None
         ) -> torch.Tensor:
             """
-            Forward pass of IndoBERT + RCNN.
-
-            Parameters
-            ----------
-            input_ids : Tensor of shape (batch_size, seq_len)
-            attention_mask : Tensor of shape (batch_size, seq_len)
-            bert_embeddings : Optional precomputed embeddings (batch_size, seq_len, 768)
-
-            Returns
-            -------
-            logits : Tensor of shape (batch_size, num_classes)
+            Forward pass of IndoBERT + RCNN with strict attention mask enforcement.
             """
             if bert_embeddings is not None:
                 token_embeddings = bert_embeddings
@@ -169,18 +161,27 @@ if HAS_TORCH:
             else:
                 raise RuntimeError("Either self.bert must be initialized or bert_embeddings provided.")
 
+            # Zero-out padding representations before LSTM
+            mask_3d = attention_mask.unsqueeze(-1).float()
+            token_embeddings = token_embeddings * mask_3d
+
             # Recurrent context: Bidirectional LSTM
             lstm_out, _ = self.lstm(token_embeddings)  # (B, L, 2*hidden_dim)
 
             # Concatenate token representation with recurrent context
-            combined = torch.cat([token_embeddings, lstm_out], dim=-1)  # (B, L, 768 + 2*hidden_dim)
+            combined = torch.cat([token_embeddings, lstm_out], dim=-1)  # (B, L, combined_dim)
 
             # Transpose for Conv1d: (B, Channels, Length)
             combined_t = combined.transpose(1, 2)
             conv_out = F.relu(self.conv(combined_t))  # (B, conv_filters, L)
 
+            # CRITICAL: Apply attention mask before max-over-time pooling so padding tokens
+            # cannot contribute to or dominate the max activation!
+            mask_for_conv = attention_mask.unsqueeze(1).bool()  # (B, 1, L)
+            conv_out_masked = conv_out.masked_fill(~mask_for_conv, -1e9)
+
             # Max-over-time pooling
-            pooled = F.adaptive_max_pool1d(conv_out, 1).squeeze(-1)  # (B, conv_filters)
+            pooled = F.adaptive_max_pool1d(conv_out_masked, 1).squeeze(-1)  # (B, conv_filters)
 
             # Dense Classification
             x = self.dropout(pooled)
@@ -219,17 +220,140 @@ class StuntingTextDataset(Dataset):
         return item
 
 
+def prepare_dataset_splits(
+    texts: List[str],
+    labels: List[Union[str, int]],
+    label2id: Dict[str, int],
+    train_ratio: float = 0.70,
+    val_ratio: float = 0.15,
+    test_ratio: float = 0.15,
+    seed: int = 42
+) -> Dict[str, Any]:
+    """
+    Validate dataset, prevent data leakage across splits, and perform stratified splitting.
+
+    Requirements:
+    - Text-label count alignment.
+    - Rejects unknown labels not in label2id.
+    - Checks for duplicate text records and ensures no data leakage.
+    - Requires sufficient samples per class for valid research evaluation.
+    """
+    if len(texts) != len(labels):
+        raise ValueError(
+            f"Input length mismatch: {len(texts)} texts provided for {len(labels)} labels."
+        )
+
+    if len(texts) < 10:
+        raise ValueError(
+            f"Dataset has only {len(texts)} samples. A defensible research model requires "
+            "sufficient samples for train/validation/test splits (minimum 10 samples)."
+        )
+
+    if not math.isclose(train_ratio + val_ratio + test_ratio, 1.0, abs_tol=1e-3):
+        raise ValueError(
+            f"Split ratios must sum to 1.0, got train={train_ratio}, val={val_ratio}, test={test_ratio}"
+        )
+
+    # Validate all labels and convert to integer IDs
+    int_labels = []
+    for idx, l in enumerate(labels):
+        if isinstance(l, str):
+            clean_l = l.strip()
+            if clean_l not in label2id:
+                raise ValueError(
+                    f"Unknown label '{l}' at index {idx}. Valid classes: {list(label2id.keys())}."
+                )
+            int_labels.append(label2id[clean_l])
+        elif isinstance(l, int):
+            if l not in label2id.values():
+                raise ValueError(
+                    f"Unknown integer label ID '{l}' at index {idx}. Valid IDs: {list(label2id.values())}."
+                )
+            int_labels.append(l)
+        else:
+            raise ValueError(f"Invalid label type '{type(l)}' at index {idx}.")
+
+    # Group sample indices by clean text to prevent data leakage (duplicate text across splits)
+    text_to_indices: Dict[str, List[int]] = {}
+    for idx, (t, l) in enumerate(zip(texts, int_labels)):
+        clean_t = str(t).strip()
+        if clean_t not in text_to_indices:
+            text_to_indices[clean_t] = []
+        text_to_indices[clean_t].append(idx)
+
+    # Stratify by class
+    rng = random.Random(seed)
+    class_groups: Dict[int, List[List[int]]] = {cid: [] for cid in label2id.values()}
+
+    for clean_t, indices in text_to_indices.items():
+        # Representative label for this text group
+        grp_label = int_labels[indices[0]]
+        class_groups[grp_label].append(indices)
+
+    train_indices: List[int] = []
+    val_indices: List[int] = []
+    test_indices: List[int] = []
+
+    split_stats = {"class_distribution": {}, "duplicates_grouped": len(texts) - len(text_to_indices)}
+
+    for cid, groups in class_groups.items():
+        rng.shuffle(groups)
+        n_grps = len(groups)
+        split_stats["class_distribution"][cid] = n_grps
+
+        n_train = max(1, int(round(n_grps * train_ratio)))
+        n_val = max(1, int(round(n_grps * val_ratio))) if (n_grps - n_train) >= 2 else (1 if n_grps > 1 else 0)
+        n_test = n_grps - n_train - n_val
+
+        # If too small for 3-way split, prioritize train then val
+        if n_test < 0:
+            n_test = 0
+            n_val = max(0, n_grps - n_train)
+
+        train_grps = groups[:n_train]
+        val_grps = groups[n_train : n_train + n_val]
+        test_grps = groups[n_train + n_val :]
+
+        for g in train_grps:
+            train_indices.extend(g)
+        for g in val_grps:
+            val_indices.extend(g)
+        for g in test_grps:
+            test_indices.extend(g)
+
+    # Check for empty validation or test sets
+    if len(val_indices) == 0:
+        logger.warning("Validation set is empty due to small class sizes. Reallocating samples.")
+        if len(train_indices) > 2:
+            val_indices.append(train_indices.pop())
+
+    return {
+        "train_texts": [texts[i] for i in train_indices],
+        "train_labels": [int_labels[i] for i in train_indices],
+        "val_texts": [texts[i] for i in val_indices],
+        "val_labels": [int_labels[i] for i in val_indices],
+        "test_texts": [texts[i] for i in test_indices],
+        "test_labels": [int_labels[i] for i in test_indices],
+        "stats": split_stats,
+        "counts": {
+            "total": len(texts),
+            "train": len(train_indices),
+            "val": len(val_indices),
+            "test": len(test_indices)
+        }
+    }
+
+
 class IndoBERTRCNNPipeline:
     """
-    High-level research pipeline for IndoBERT + RCNN training, inference,
-    checkpoint saving, and validation.
+    High-level research pipeline for IndoBERT + RCNN training, validation,
+    checkpoint saving, evaluation, and inference.
     """
 
     def __init__(
         self,
         checkpoint_path: Optional[str] = None,
         model_name: str = "indobenchmark/indobert-base-p1",
-        num_classes: int = 7,
         label2id: Optional[Dict[str, int]] = None
     ):
         self.model_name = model_name
@@ -241,6 +365,8 @@ class IndoBERTRCNNPipeline:
         self.model = None
         self.tokenizer = None
         self.is_loaded = False
+        self.is_trained = False
+        self.metadata: Dict[str, Any] = {}
 
         if checkpoint_path and Path(checkpoint_path).exists():
             self.load_checkpoint(checkpoint_path)
@@ -248,9 +374,9 @@ class IndoBERTRCNNPipeline:
     def initialize_new_model(self) -> None:
         """Instantiate a new untrained IndoBERT + RCNN model with tokenizer."""
         if not HAS_TORCH:
-            raise ImportError("PyTorch is required for IndoBERTRCNNPipeline. Please install torch: pip install torch")
+            raise ImportError("PyTorch is required for IndoBERTRCNNPipeline. Please install torch.")
         if not HAS_TRANSFORMERS:
-            raise ImportError("HuggingFace Transformers is required. Please install: pip install transformers")
+            raise ImportError("Transformers is required. Please install transformers.")
 
         self.tokenizer = AutoTokenizer.from_pretrained(self.model_name)
         self.model = IndoBERTRCNNModel(
@@ -258,9 +384,16 @@ class IndoBERTRCNNPipeline:
             num_classes=self.num_classes
         )
         self.is_loaded = True
+        self.is_trained = False
 
-    def save_checkpoint(self, save_path: str) -> None:
-        """Save model state dict, labels, and metadata to .pt file."""
+    def save_checkpoint(
+        self,
+        save_path: str,
+        best_val_metric: Optional[float] = None,
+        history: Optional[Dict[str, Any]] = None,
+        split_stats: Optional[Dict[str, Any]] = None
+    ) -> None:
+        """Save model weights, mappings, and full experiment metadata."""
         if not self.is_loaded or self.model is None:
             raise RuntimeError("Cannot save an uninitialized model.")
 
@@ -274,10 +407,14 @@ class IndoBERTRCNNPipeline:
             "id2label": self.id2label,
             "num_classes": self.num_classes,
             "hidden_dim": getattr(self.model, "hidden_dim", 256),
-            "conv_filters": getattr(self.model, "conv_filters", 256)
+            "conv_filters": getattr(self.model, "conv_filters", 256),
+            "is_trained": True,
+            "best_val_metric": best_val_metric,
+            "history": history or {},
+            "split_stats": split_stats or {}
         }
         torch.save(checkpoint_data, str(save_p))
-        logger.info("Saved IndoBERT+RCNN checkpoint to %s", save_p)
+        logger.info("Saved trained IndoBERT+RCNN checkpoint to %s", save_p)
 
     def load_checkpoint(self, checkpoint_path: str) -> None:
         """Load trained model weights and mappings from checkpoint file."""
@@ -295,6 +432,11 @@ class IndoBERTRCNNPipeline:
         self.id2label = {v: k for k, v in self.label2id.items()}
         self.num_classes = len(self.label2id)
         self.model_name = checkpoint.get("model_name", self.model_name)
+        self.metadata = {
+            "best_val_metric": checkpoint.get("best_val_metric"),
+            "history": checkpoint.get("history"),
+            "split_stats": checkpoint.get("split_stats")
+        }
 
         self.tokenizer = AutoTokenizer.from_pretrained(self.model_name)
         self.model = IndoBERTRCNNModel(
@@ -304,7 +446,37 @@ class IndoBERTRCNNPipeline:
         self.model.load_state_dict(checkpoint["model_state_dict"])
         self.model.eval()
         self.is_loaded = True
+        self.is_trained = checkpoint.get("is_trained", True)
         logger.info("Successfully loaded IndoBERT+RCNN checkpoint from %s", checkpoint_path)
+
+    def _evaluate_dataset_loss_and_preds(
+        self,
+        loader: DataLoader,
+        criterion: nn.Module,
+        device: torch.device
+    ) -> Tuple[float, List[int], List[int]]:
+        """Compute average loss and collect true/predicted labels on a DataLoader."""
+        self.model.eval()
+        total_loss = 0.0
+        all_preds = []
+        all_trues = []
+
+        with torch.no_grad():
+            for batch in loader:
+                input_ids = batch["input_ids"].to(device)
+                attention_mask = batch["attention_mask"].to(device)
+                labels = batch["label"].to(device)
+
+                logits = self.model(input_ids, attention_mask)
+                loss = criterion(logits, labels)
+                total_loss += loss.item()
+
+                preds = logits.argmax(dim=-1).cpu().tolist()
+                all_preds.extend(preds)
+                all_trues.extend(labels.cpu().tolist())
+
+        avg_loss = total_loss / max(1, len(loader))
+        return avg_loss, all_trues, all_preds
 
     def train(
         self,
@@ -318,7 +490,7 @@ class IndoBERTRCNNPipeline:
         checkpoint_save_path: Optional[str] = None
     ) -> Dict[str, Any]:
         """
-        Train the IndoBERT + RCNN model on labeled clinical stunting records.
+        Train the IndoBERT + RCNN model with strict validation tracking and best-checkpoint selection.
         """
         if not HAS_TORCH or not HAS_TRANSFORMERS:
             raise ImportError("PyTorch and Transformers are required for training.")
@@ -326,18 +498,27 @@ class IndoBERTRCNNPipeline:
         if self.model is None or self.tokenizer is None:
             self.initialize_new_model()
 
-        # Convert string labels to integer IDs if needed
+        # Convert labels
         y_train = [
-            self.label2id[l] if isinstance(l, str) else int(l)
+            self.label2id[l.strip()] if isinstance(l, str) else int(l)
             for l in train_labels
         ]
 
         train_ds = StuntingTextDataset(train_texts, y_train, self.tokenizer)
         train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True)
 
+        has_val = val_texts is not None and val_labels is not None and len(val_texts) > 0
+        val_loader = None
+        if has_val:
+            y_val = [
+                self.label2id[l.strip()] if isinstance(l, str) else int(l)
+                for l in val_labels
+            ]
+            val_ds = StuntingTextDataset(val_texts, y_val, self.tokenizer)
+            val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False)
+
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.model.to(device)
-        self.model.train()
 
         criterion = nn.CrossEntropyLoss()
         optimizer = torch.optim.AdamW(
@@ -346,10 +527,21 @@ class IndoBERTRCNNPipeline:
             weight_decay=0.01
         )
 
-        history = {"epochs": [], "loss": [], "val_accuracy": []}
+        history = {
+            "epochs": [],
+            "train_loss": [],
+            "val_loss": [],
+            "val_accuracy": []
+        }
+
+        best_val_loss = float("inf")
+        best_state_dict = None
+        best_epoch = 1
 
         for epoch in range(epochs):
-            total_loss = 0.0
+            self.model.train()
+            total_train_loss = 0.0
+
             for batch in train_loader:
                 optimizer.zero_grad()
                 input_ids = batch["input_ids"].to(device)
@@ -360,39 +552,64 @@ class IndoBERTRCNNPipeline:
                 loss = criterion(logits, labels)
                 loss.backward()
                 optimizer.step()
-                total_loss += loss.item()
+                total_train_loss += loss.item()
 
-            avg_loss = total_loss / max(1, len(train_loader))
+            avg_train_loss = total_train_loss / max(1, len(train_loader))
             history["epochs"].append(epoch + 1)
-            history["loss"].append(round(avg_loss, 4))
-            logger.info("Epoch %d/%d - Loss: %.4f", epoch + 1, epochs, avg_loss)
+            history["train_loss"].append(round(avg_train_loss, 4))
+
+            # Validation evaluation
+            if val_loader is not None:
+                val_loss, y_true, y_pred = self._evaluate_dataset_loss_and_preds(
+                    val_loader, criterion, device
+                )
+                acc = sum(1 for yt, yp in zip(y_true, y_pred) if yt == yp) / max(1, len(y_true))
+                history["val_loss"].append(round(val_loss, 4))
+                history["val_accuracy"].append(round(acc, 4))
+
+                if val_loss < best_val_loss:
+                    best_val_loss = val_loss
+                    best_epoch = epoch + 1
+                    best_state_dict = {k: v.cpu().clone() for k, v in self.model.state_dict().items()}
+                logger.info(
+                    "Epoch %d/%d - Train Loss: %.4f - Val Loss: %.4f - Val Acc: %.4f",
+                    epoch + 1, epochs, avg_train_loss, val_loss, acc
+                )
+            else:
+                history["val_loss"].append(None)
+                history["val_accuracy"].append(None)
+                logger.info("Epoch %d/%d - Train Loss: %.4f", epoch + 1, epochs, avg_train_loss)
+
+        # Restore best model weights
+        if best_state_dict is not None:
+            self.model.load_state_dict(best_state_dict)
 
         self.model.eval()
+        self.is_trained = True
+
         if checkpoint_save_path:
-            self.save_checkpoint(checkpoint_save_path)
+            self.save_checkpoint(
+                checkpoint_save_path,
+                best_val_metric=round(best_val_loss, 4) if best_val_loss != float("inf") else None,
+                history=history,
+                split_stats={"best_epoch": best_epoch}
+            )
 
         return history
 
     def predict(self, texts: List[str]) -> List[Dict[str, Any]]:
         """
-        Run inference on a batch of clinical note texts.
+        Run inference on clinical note texts.
 
-        Returns
-        -------
-        List of dicts:
-        {
-            "label_id": int,
-            "label_key": str,
-            "label_description": str,
-            "confidence": float,
-            "probabilities": Dict[str, float]
-        }
+        Strict contract:
+        - Only permitted when model is trained and checkpoint loaded.
+        - Raises ModelNotTrainedError otherwise (no silent heuristic fallbacks).
         """
-        if not self.is_loaded or self.model is None:
+        if not self.is_loaded or self.model is None or not self.is_trained:
             raise ModelNotTrainedError(
                 "IndoBERT + RCNN model checkpoint is not loaded or trained. "
-                "Inference requires a trained checkpoint (.pt file) with actual weights. "
-                "Heuristic fallback is strictly disabled in accordance with the research methodology."
+                "Inference requires a verified trained checkpoint (.pt file). "
+                "Heuristic fallback is strictly prohibited by research methodology."
             )
 
         if not texts:
@@ -408,11 +625,10 @@ class IndoBERTRCNNPipeline:
         with torch.no_grad():
             for t in cleaned_texts:
                 if not t:
-                    # Safe handling for empty text
                     results.append({
                         "label_id": -1,
                         "label_key": "UNSPECIFIED",
-                        "label_description": "Teks Catatan Klinis Kosong / Tidak Tersedia",
+                        "label_description": "Catatan Klinis Kosong / Tidak Tersedia",
                         "confidence": 0.0,
                         "probabilities": {}
                     })
@@ -433,7 +649,7 @@ class IndoBERTRCNNPipeline:
 
                 best_idx = int(probs.argmax())
                 best_conf = float(probs[best_idx])
-                best_key = self.id2label.get(best_idx, "UNKNOWN")
+                best_key = self.id2label.get(best_idx, f"CLASS_{best_idx}")
                 best_desc = DEFAULT_LABEL_DESCRIPTIONS.get(best_key, best_key)
 
                 prob_dict = {

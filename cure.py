@@ -6,11 +6,15 @@ Algorithm for Large Databases. ACM SIGMOD Record, 27(2), 73-84.
 
 Key Principles:
 1. Represents each cluster using a fixed number (c) of well-scattered points.
-2. Shrinks representative points towards the cluster centroid by alpha (0 <= alpha <= 1).
-3. Cluster distance = minimum distance between any pair of shrunk representatives.
+2. Shrinks representative points towards the cluster centroid by factor alpha (0 <= alpha <= 1).
+3. Cluster distance = minimum distance between any pair of shrunk representatives:
+   d(u, v) = min_{p in Rep(u), q in Rep(v)} ||p - q||_2
 4. Robust against outliers and non-spherical clusters.
-5. Fully compatible with both NumPy environments and pure-Python standard environments.
+5. Consistent scaling: exposes the transformed feature matrix for valid downstream evaluation.
+6. Rigorous input validation: rejects unhandled NaNs/Infs without arbitrary silent conversions.
 """
+
+from __future__ import annotations
 
 import math
 from typing import List, Tuple, Dict, Optional, Any, Union
@@ -69,6 +73,7 @@ class CUREClusterer:
         self.cluster_sizes_: List[int] = []
         self.feature_means_: Optional[List[float]] = None
         self.feature_stds_: Optional[List[float]] = None
+        self.X_scaled_: Optional[List[List[float]]] = None
         self.is_fitted: bool = False
 
     def _select_and_shrink_reps(
@@ -135,36 +140,73 @@ class CUREClusterer:
                     min_dist = d
         return min_dist
 
-    def _to_clean_list(self, X: Any) -> Tuple[List[List[float]], int, int]:
-        """Convert input array or list of lists into clean Python float matrix."""
+    def _validate_and_clean_input(self, X: Any) -> Tuple[List[List[float]], int, int]:
+        """
+        Validate input dimensionality and reject invalid (NaN/Inf) values.
+        Does NOT silently fabricate or convert invalid values to arbitrary numbers.
+        """
+        if X is None:
+            raise ValueError("Input feature matrix X cannot be None.")
+
+        # Convert to list of lists if numpy or other iterable
         if HAS_NUMPY and isinstance(X, np.ndarray):
-            X_clean = np.nan_to_num(X, nan=0.0, posinf=5.0, neginf=-5.0)
-            rows = X_clean.tolist()
+            if X.ndim != 2:
+                raise ValueError(f"Expected 2D array, got shape {X.shape}")
+            if np.isnan(X).any() or np.isinf(X).any():
+                n_nan = int(np.isnan(X).sum())
+                n_inf = int(np.isinf(X).sum())
+                raise ValueError(
+                    f"Input matrix X contains {n_nan} NaN and {n_inf} infinite values. "
+                    "In accordance with research methodology, invalid values must be validated "
+                    "or excluded before clustering rather than silently substituted."
+                )
+            rows = X.tolist()
         else:
             rows = []
-            for r in X:
+            for r_idx, r in enumerate(X):
+                if not hasattr(r, "__iter__"):
+                    raise ValueError(f"Row {r_idx} is not an iterable feature vector.")
                 clean_r = []
-                for val in r:
+                for c_idx, val in enumerate(r):
                     try:
                         v = float(val)
-                        if math.isnan(v):
-                            v = 0.0
                     except (ValueError, TypeError):
-                        v = 0.0
+                        raise ValueError(
+                            f"Non-numeric value '{val}' at row {r_idx}, col {c_idx}. "
+                            "CURE requires numerical features."
+                        )
+                    if math.isnan(v) or math.isinf(v):
+                        raise ValueError(
+                            f"Invalid numeric value (NaN or Inf) at row {r_idx}, col {c_idx}. "
+                            "Observations with missing features must be filtered before clustering."
+                        )
                     clean_r.append(v)
                 rows.append(clean_r)
 
         N = len(rows)
-        D = len(rows[0]) if N > 0 else 0
-        return rows, N, D
-
-    def fit(self, X: Any) -> "CUREClusterer":
-        """Fit CURE clustering on feature matrix X."""
-        rows, N, D = self._to_clean_list(X)
         if N == 0:
             raise ValueError("Input feature matrix X has 0 samples.")
 
-        # Compute means and stds for normalization
+        D = len(rows[0])
+        if D == 0:
+            raise ValueError("Input feature matrix X has 0 features (dimensionality D=0).")
+
+        for r_idx, r in enumerate(rows):
+            if len(r) != D:
+                raise ValueError(
+                    f"Inconsistent feature dimension: row {r_idx} has {len(r)} features, "
+                    f"expected {D} features."
+                )
+
+        return rows, N, D
+
+    def fit(self, X: Any) -> "CUREClusterer":
+        """
+        Fit CURE clustering on feature matrix X.
+        """
+        rows, N, D = self._validate_and_clean_input(X)
+
+        # Compute means and standard deviations for standardized feature space
         means = [0.0] * D
         for r in rows:
             for j in range(D):
@@ -177,7 +219,7 @@ class CUREClusterer:
                 diff = r[j] - means[j]
                 stds[j] += diff * diff
         stds = [math.sqrt(s / N) for s in stds]
-        # Avoid division by zero for constant features
+        # Handle constant features (zero variance) without zero-division
         stds = [s if s > 1e-7 else 1.0 for s in stds]
 
         self.feature_means_ = means
@@ -188,6 +230,7 @@ class CUREClusterer:
             [(r[j] - means[j]) / stds[j] for j in range(D)]
             for r in rows
         ]
+        self.X_scaled_ = scaled
 
         target_k = min(self.n_clusters, N)
         if N <= target_k:
@@ -212,7 +255,7 @@ class CUREClusterer:
 
         active_ids = list(range(N))
 
-        # Initial pairwise distances
+        # Initial pairwise distances between all single-point clusters
         dist_cache: Dict[Tuple[int, int], float] = {}
         for i in range(len(active_ids)):
             id_i = active_ids[i]
@@ -302,23 +345,38 @@ class CUREClusterer:
         self.is_fitted = True
         return self
 
+    def transform(self, X: Any) -> Any:
+        """
+        Transform X into the standardized feature space learned during fit.
+        Ensures consistent feature representation between clustering and evaluation.
+        """
+        if not self.is_fitted or self.feature_means_ is None or self.feature_stds_ is None:
+            raise RuntimeError("CUREClusterer must be fitted before transform.")
+
+        rows, M, D = self._validate_and_clean_input(X)
+        if D != len(self.feature_means_):
+            raise ValueError(
+                f"Feature dimension mismatch: expected {len(self.feature_means_)}, got {D}."
+            )
+
+        scaled = [
+            [(rows[i][j] - self.feature_means_[j]) / self.feature_stds_[j] for j in range(D)]
+            for i in range(M)
+        ]
+        return np.array(scaled) if HAS_NUMPY else scaled
+
     def predict(self, X: Any) -> Union[List[int], Any]:
-        """Assign each sample in X to the nearest cluster representative."""
+        """Assign each sample in X to the nearest cluster representative in scaled space."""
         if not self.is_fitted:
             raise RuntimeError("CUREClusterer must be fitted before predict.")
 
-        rows, M, D = self._to_clean_list(X)
-        means = self.feature_means_
-        stds = self.feature_stds_
-
-        scaled = [
-            [(r[j] - means[j]) / stds[j] for j in range(D)]
-            for r in rows
-        ]
+        scaled = self.transform(X)
+        rows = scaled.tolist() if HAS_NUMPY and isinstance(scaled, np.ndarray) else scaled
+        M = len(rows)
 
         preds = [0] * M
         for i in range(M):
-            pt = scaled[i]
+            pt = rows[i]
             min_dist = float("inf")
             best_c = 0
             for c_idx, reps in enumerate(self.representatives_):

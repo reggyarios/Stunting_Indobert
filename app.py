@@ -5,34 +5,57 @@ CURE-IndoBERT for Stunting Analytics
 Production Flask application providing:
 1. Multi-sheet Excel ingestion (.xlsx, .xls)
 2. Classical CURE (Clustering Using Representatives) algorithm with shrinkage factor alpha and c representatives
-3. Authentic IndoBERT + RCNN contextual neural architecture for clinical stunting classification
-4. Permenkes RI No. 2/2020 & WHO 2006 clinical stunting guideline assessment
-5. Multi-sheet Excel export with clearly separated CURE cluster IDs, model predictions, and Kemenkes categories
+3. IndoBERT + RCNN neural architecture for research stunting classification with validation tracking
+4. Permenkes RI No. 2/2020 guideline assessment without unsupported polynomial approximations
+5. Multi-sheet Excel export preserving source data
 6. Rigorous classification and clustering evaluation on independent ground truth
 """
 
 import os
 import sys
 import uuid
+import secrets
 import logging
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Any
 
-from flask import (
-    Flask, render_template, request, redirect,
-    url_for, send_file, jsonify, flash, abort
-)
-from werkzeug.utils import secure_filename
-import pandas as pd
-import numpy as np
+try:
+    from flask import (
+        Flask, render_template, request, redirect,
+        url_for, send_file, jsonify, flash, abort
+    )
+    from werkzeug.utils import secure_filename
+    HAS_FLASK = True
+except ImportError:
+    HAS_FLASK = False
+    Flask = None
+    render_template = request = redirect = url_for = send_file = jsonify = flash = abort = None
+    secure_filename = lambda f: f
+
+try:
+    import pandas as pd
+    HAS_PANDAS = True
+except ImportError:
+    HAS_PANDAS = False
+    pd = None
+
+try:
+    import numpy as np
+    HAS_NUMPY = True
+except ImportError:
+    HAS_NUMPY = False
+    np = None
 
 from cure import CUREClusterer
-from indobert_rcnn import IndoBERTRCNNPipeline, ModelNotTrainedError, DEFAULT_LABEL2ID
+from indobert_rcnn import (
+    IndoBERTRCNNPipeline, ModelNotTrainedError, DEFAULT_LABEL2ID,
+    prepare_dataset_splits
+)
 from pipeline import StuntingResearchPipeline
 from evaluation import evaluate_classification, evaluate_clustering
 
-# Configure logging
+# Configure logging without sensitive PII
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
@@ -55,11 +78,19 @@ DEFAULT_CHECKPOINT_PATH = CHECKPOINT_DIR / "indobert_rcnn_stunting.pt"
 
 ALLOWED_EXTENSIONS = {"xlsx", "xls"}
 
-app = Flask(__name__, template_folder=str(TEMPLATE_DIR))
-app.config["SECRET_KEY"] = os.environ.get("SECRET_KEY", "cure-indobert-secret-key-2026")
-app.config["MAX_CONTENT_LENGTH"] = 64 * 1024 * 1024  # 64 MB
-app.config["UPLOAD_FOLDER"] = str(UPLOAD_DIR)
-app.config["OUTPUT_FOLDER"] = str(OUTPUT_DIR)
+if HAS_FLASK and Flask is not None:
+    app = Flask(__name__, template_folder=str(TEMPLATE_DIR))
+    app.config["SECRET_KEY"] = os.environ.get("SECRET_KEY") or secrets.token_hex(32)
+    app.config["MAX_CONTENT_LENGTH"] = 64 * 1024 * 1024  # 64 MB
+    app.config["UPLOAD_FOLDER"] = str(UPLOAD_DIR)
+    app.config["OUTPUT_FOLDER"] = str(OUTPUT_DIR)
+else:
+    class DummyFlask:
+        config = {}
+        def route(self, *args, **kwargs):
+            return lambda fn: fn
+    app = DummyFlask()
+    app.config["SECRET_KEY"] = os.environ.get("SECRET_KEY") or secrets.token_hex(32)
 
 # In-memory job state cache
 JOB_STORE: Dict[str, Dict[str, Any]] = {}
@@ -148,6 +179,7 @@ def upload_file():
 
     except Exception as e:
         logger.exception("Pipeline failure on job %s: %s", job_id, str(e))
+        # User-friendly message without exposing internal system paths
         flash(f"Terjadi kesalahan saat memproses data: {str(e)}", "error")
         return redirect(url_for("index"))
 
@@ -180,28 +212,28 @@ def download_result(job_id: str):
 
 @app.route("/sample-dataset", methods=["GET"])
 def download_sample_dataset():
-    """Serve benchmark child stunting dataset."""
-    sample_path = OUTPUT_DIR / "Benchmark_Child_Stunting_Indonesia.xlsx"
+    """Serve synthetic demonstration child stunting dataset."""
+    sample_path = OUTPUT_DIR / "Demonstration_Synthetic_Stunting_Data.xlsx"
     if not sample_path.exists():
         generate_benchmark_stunting_workbook(sample_path)
 
     return send_file(
         str(sample_path),
         as_attachment=True,
-        download_name="Benchmark_Child_Stunting_Indonesia.xlsx",
+        download_name="Demonstration_Synthetic_Stunting_Data.xlsx",
         mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
     )
 
 
 @app.route("/load-benchmark", methods=["POST"])
 def load_benchmark():
-    """Run research pipeline directly on benchmark dataset."""
-    sample_path = OUTPUT_DIR / "Benchmark_Child_Stunting_Indonesia.xlsx"
+    """Run research pipeline on synthetic demonstration dataset."""
+    sample_path = OUTPUT_DIR / "Demonstration_Synthetic_Stunting_Data.xlsx"
     if not sample_path.exists():
         generate_benchmark_stunting_workbook(sample_path)
 
     job_id = str(uuid.uuid4())
-    output_filename = "CURE_IndoBERT_Enriched_Benchmark.xlsx"
+    output_filename = "CURE_IndoBERT_Enriched_Demo.xlsx"
     output_path = OUTPUT_DIR / f"{job_id}_{output_filename}"
 
     pipeline = StuntingResearchPipeline(
@@ -212,7 +244,7 @@ def load_benchmark():
     )
     metrics = pipeline.process_excel(sample_path, output_path)
     metrics["job_id"] = job_id
-    metrics["original_filename"] = "Benchmark_Child_Stunting_Indonesia.xlsx"
+    metrics["original_filename"] = "Demonstration_Synthetic_Stunting_Data.xlsx"
     metrics["output_filename"] = output_filename
     metrics["output_path"] = str(output_path)
 
@@ -227,8 +259,8 @@ def load_benchmark():
 @app.route("/api/train", methods=["POST"])
 def train_model():
     """
-    Train IndoBERT + RCNN model on provided labeled dataset and save checkpoint.
-    Expects JSON payload with 'texts' and 'labels' or multipart file with labeled Excel.
+    Train IndoBERT + RCNN model on provided labeled dataset with stratified splitting
+    and validation tracking.
     """
     try:
         data = request.get_json(silent=True)
@@ -241,22 +273,42 @@ def train_model():
         texts = data["texts"]
         labels = data["labels"]
 
-        if len(texts) < 5 or len(labels) < 5:
+        if len(texts) < 10 or len(labels) < 10:
             return jsonify({
                 "status": "error",
-                "message": "At least 5 labeled samples required for training."
+                "message": (
+                    f"Provided {len(texts)} samples. In accordance with research methodology, "
+                    "at least 10 samples are required to perform a defensible train/val/test split."
+                )
             }), 400
 
         pipeline = IndoBERTRCNNPipeline()
         pipeline.initialize_new_model()
+
+        # Configurable split ratios
+        train_ratio = float(data.get("train_ratio", 0.70))
+        val_ratio = float(data.get("val_ratio", 0.15))
+        test_ratio = float(data.get("test_ratio", 0.15))
+
+        # Dataset splitting with leakage prevention
+        splits = prepare_dataset_splits(
+            texts=texts,
+            labels=labels,
+            label2id=pipeline.label2id,
+            train_ratio=train_ratio,
+            val_ratio=val_ratio,
+            test_ratio=test_ratio
+        )
 
         epochs = int(data.get("epochs", 3))
         batch_size = int(data.get("batch_size", 8))
         lr = float(data.get("lr", 2e-5))
 
         history = pipeline.train(
-            train_texts=texts,
-            train_labels=labels,
+            train_texts=splits["train_texts"],
+            train_labels=splits["train_labels"],
+            val_texts=splits["val_texts"],
+            val_labels=splits["val_labels"],
             epochs=epochs,
             batch_size=batch_size,
             lr=lr,
@@ -267,6 +319,8 @@ def train_model():
             "status": "success",
             "message": f"Successfully trained IndoBERT + RCNN and saved checkpoint to {DEFAULT_CHECKPOINT_PATH.name}",
             "checkpoint_path": str(DEFAULT_CHECKPOINT_PATH),
+            "split_counts": splits["counts"],
+            "split_stats": splits["stats"],
             "history": history
         })
 
@@ -290,25 +344,29 @@ def health_check():
 
 def generate_benchmark_stunting_workbook(file_path: Path):
     """
-    Generate authentic Indonesian child stunting dataset (.xlsx).
-    Provides realistic Posyandu & Puskesmas records with clinical notes and recorded Z-scores.
+    Generate SYNTHETIC DEMONSTRATION child stunting dataset (.xlsx).
+
+    IMPORTANT RESEARCH NOTICE:
+    This dataset is entirely synthetic, generated for software testing and user interface
+    demonstration purposes only. It must NOT be described as authentic, clinically collected,
+    or representative of actual research participants, nor used to claim real-world model accuracy.
     """
-    names_male = ["Muhammad Rizky", "Alif Pratama", "Bima Arya", "Dimas Saputra", "Fikri Maulana", "Gilang Ramadhan", "Haikal Putra", "Ilham Fauzi", "Kenzo Raditya", "Raffa Putra"]
-    names_female = ["Aisyah Putri", "Anindita Zahra", "Cantika Dewi", "Dara Ayu", "Fadhila Nur", "Gita Lestari", "Hanum Salsabila", "Inara Kirana", "Keysha Anindya", "Naila Rahma"]
-    puskesmas_list = ["Puskesmas Sukamaju", "Puskesmas Cikarang Barat", "Puskesmas Cibitung", "Puskesmas Tambun Selatan"]
-    desa_list = ["Desa Mekarsari", "Desa Sukadanau", "Desa Wanajaya", "Desa Telaga Asih"]
+    names_male = ["Anak A", "Anak B", "Anak C", "Anak D", "Anak E", "Anak F", "Anak G", "Anak H", "Anak I", "Anak J"]
+    names_female = ["Anak K", "Anak L", "Anak M", "Anak N", "Anak O", "Anak P", "Anak Q", "Anak R", "Anak S", "Anak T"]
+    puskesmas_list = ["Puskesmas Wilayah Barat", "Puskesmas Wilayah Timur"]
+    desa_list = ["Desa A", "Desa B"]
 
     notes_templates = [
-        "Balita tampak kurus, riwayat diare berulang dalam 2 bulan terakhir, KMS pita kuning.",
+        "Balita tampak kurus, riwayat batuk berulang dalam 2 bulan terakhir, KMS pita kuning.",
         "Pertumbuhan optimal, anak sangat aktif, imunisasi dasar lengkap, ASI eksklusif 6 bulan.",
-        "Anak sangat pendek untuk usianya, nafsu makan minim, asupan protein hewani sangat rendah, riwayat ISPA.",
-        "Bawah Garis Merah (BGM) pada KMS posyandu, berat badan 2 bulan tidak naik berturut-turut (2T).",
-        "Tinggi badan sesuai usia, motorik kasar baik, konsumsi makanan keluarga variatif telur dan ikan.",
-        "Gejala perawakan pendek (stunting), sanitasi air sumur tercemar, riwayat berat lahir rendah (BBLR 2.1 kg).",
-        "Lingkar lengan atas (LiLA) 11.2 cm (pita merah), asupan gizi makro sangat kurang, ibu bekerja.",
-        "Pertumbuhan stabil di kurva hijau KMS, stimulasi tumbuh kembang baik oleh orang tua.",
-        "Balita tampak lesu, nafsu makan berkurang, riwayat batuk kronis, dicurigai kontak TB keluarga.",
-        "Gizi kurang dengan risiko gagal tumbuh, MPASI didominasi karbohidrat bubur tanpa variasi lauk."
+        "Anak sangat pendek untuk usianya, nafsu makan minim, asupan protein hewani rendah.",
+        "Bawah Garis Merah (BGM) pada KMS posyandu, berat badan 2 bulan tidak naik berturut-turut.",
+        "Tinggi badan sesuai usia, motorik kasar baik, konsumsi makanan keluarga variatif.",
+        "Gejala perawakan pendek, riwayat berat lahir rendah (BBLR 2.2 kg).",
+        "Lingkar lengan atas (LiLA) 11.2 cm, asupan gizi makro kurang.",
+        "Pertumbuhan stabil di kurva hijau KMS, stimulasi tumbuh kembang baik.",
+        "Balita tampak lesu, nafsu makan berkurang, riwayat kontak batuk kronis keluarga.",
+        "Gizi kurang dengan risiko gagal tumbuh, MPASI didominasi bubur karbohidrat."
     ]
 
     np.random.seed(42)
@@ -317,7 +375,7 @@ def generate_benchmark_stunting_workbook(file_path: Path):
         rows_s1 = []
         for i in range(30):
             is_male = np.random.rand() > 0.5
-            nama = np.random.choice(names_male if is_male else names_female) + f" {i+1}"
+            nama = np.random.choice(names_male if is_male else names_female) + f"-{i+1}"
             usia = int(np.random.randint(6, 59))
 
             stunt_prob = np.random.rand()
@@ -341,7 +399,7 @@ def generate_benchmark_stunting_workbook(file_path: Path):
             bb = round(3.2 + (usia * 0.28) + (waz * 1.4), 1)
 
             rows_s1.append({
-                "No_Registrasi": f"REG-PKM-{1001 + i}",
+                "No_Registrasi": f"DEMO-{1001 + i}",
                 "Nama_Balita": nama,
                 "Jenis_Kelamin": "Laki-laki" if is_male else "Perempuan",
                 "Usia_Bulan": usia,
@@ -350,17 +408,17 @@ def generate_benchmark_stunting_workbook(file_path: Path):
                 "ZScore_TB_U": haz,
                 "ZScore_BB_U": waz,
                 "ZScore_BB_TB": whz,
-                "Nama_Puskesmas": np.random.choice(puskesmas_list),
+                "Puskesmas": np.random.choice(puskesmas_list),
                 "Kelurahan_Desa": np.random.choice(desa_list),
-                "Catatan_Pemeriksaan_Klinis": catatan
+                "Catatan_Pemeriksaan": catatan
             })
         df1 = pd.DataFrame(rows_s1)
-        df1.to_excel(writer, sheet_name="Puskesmas_Kecamatan_Barat", index=False)
+        df1.to_excel(writer, sheet_name="Demo_Wilayah_Barat", index=False)
 
         rows_s2 = []
         for i in range(25):
             is_male = np.random.rand() > 0.5
-            nama = np.random.choice(names_male if is_male else names_female) + f" M-{i+1}"
+            nama = np.random.choice(names_male if is_male else names_female) + f"-{i+101}"
             usia = int(np.random.randint(9, 48))
             haz = round(float(np.random.uniform(-3.5, 1.2)), 2)
             waz = round(float(np.random.uniform(-3.0, 1.0)), 2)
@@ -370,7 +428,7 @@ def generate_benchmark_stunting_workbook(file_path: Path):
             catatan = np.random.choice(notes_templates)
 
             rows_s2.append({
-                "ID_Anak": f"POS-MLT-{201 + i}",
+                "ID_Anak": f"DEMO-{201 + i}",
                 "Nama_Lengkap": nama,
                 "Gender": "L" if is_male else "P",
                 "Umur_Bulan": usia,
@@ -379,11 +437,11 @@ def generate_benchmark_stunting_workbook(file_path: Path):
                 "HAZ": haz,
                 "WAZ": waz,
                 "WHZ": whz,
-                "Posyandu": "Posyandu Melati 03",
-                "Keterangan_Bidan_Desa": catatan
+                "Posyandu": "Posyandu Demo",
+                "Keterangan_Pemeriksaan": catatan
             })
         df2 = pd.DataFrame(rows_s2)
-        df2.to_excel(writer, sheet_name="Posyandu_Melati_Timur", index=False)
+        df2.to_excel(writer, sheet_name="Demo_Wilayah_Timur", index=False)
 
 
 if __name__ == "__main__":
