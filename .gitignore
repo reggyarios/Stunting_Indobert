@@ -5,3 +5,12 @@ coverage/
 *.log
 .env*
 !.env.example
+# data unggahan/hasil runtime (bisa berisi data pribadi balita)
+uploads/
+outputs/
+*.tsbuildinfo
+
+# data & model lokal (data pribadi anak, checkpoint besar)
+research/out/
+checkpoints/
+*.xlsx

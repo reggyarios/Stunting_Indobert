@@ -1,0 +1,12 @@
+# Jangan pernah memasukkan data balita ke image
+*.xlsx
+*.xls
+*.csv
+uploads/
+outputs/
+research/
+node_modules/
+.next/
+.git/
+__pycache__/
+tests/

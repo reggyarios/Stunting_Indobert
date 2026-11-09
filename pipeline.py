@@ -93,6 +93,56 @@ def parse_indonesian_numeric(val: Any) -> Optional[float]:
     return None
 
 
+NOTE_TEMPLATES = [
+    "Anak {jk} usia {u} bulan, berat badan {bb} kg, {ukur} badan {tb} cm diukur {pos}. "
+    "Z-score TB/U {haz}, BB/U {waz}, BB/TB {whz}.",
+    "Hasil penimbangan balita {jk} berumur {u} bulan: BB {bb} kg dan {ukur} {tb} cm ({pos}); "
+    "z-score tinggi menurut umur {haz} SD, berat menurut umur {waz} SD, berat menurut tinggi {whz} SD.",
+    "Pengukuran {pos} pada anak {jk} {u} bulan menunjukkan {ukur} {tb} cm dan berat {bb} kg "
+    "dengan z-score TB/U {haz}, BB/U {waz}, dan BB/TB {whz}.",
+]
+
+
+def build_note(ind: Dict[str, Any], template_idx: int = 0) -> str:
+    """
+    Narasi antropometri (catatan pemeriksaan) untuk data e-PPGBM yang tidak memiliki
+    kolom catatan. Hanya memuat ukuran dan z-score, TIDAK memuat kata status gizi.
+    Mengembalikan "" bila ada indikator yang tidak tersedia.
+    """
+    need = ("gender", "age_months", "weight_kg", "height_cm", "haz", "waz", "whz")
+    if any(ind.get(k) is None for k in need):
+        return ""
+    pos = ind.get("position") or ("Terlentang" if ind["age_months"] < 24 else "Berdiri")
+    tel = pos == "Terlentang"
+    f = lambda x, nd: f"{x:.{nd}f}".replace(".", ",")
+    return NOTE_TEMPLATES[template_idx % len(NOTE_TEMPLATES)].format(
+        jk="laki-laki" if ind["gender"] == "L" else "perempuan",
+        u=int(ind["age_months"]), bb=f(ind["weight_kg"], 1), tb=f(ind["height_cm"], 1),
+        ukur="panjang" if tel else "tinggi", pos="telentang" if tel else "berdiri",
+        haz=f(ind["haz"], 2), waz=f(ind["waz"], 2), whz=f(ind["whz"], 2),
+    )
+
+
+def permenkes_reference_label(haz: Optional[float], waz: Optional[float], whz: Optional[float]) -> Optional[str]:
+    """
+    Label acuan operasional 7 kelas (taksonomi DEFAULT_LABEL2ID) dari ambang
+    Permenkes RI No. 2/2020, prioritas indeks TB/U. Dipakai sebagai acuan evaluasi.
+    """
+    if haz is None or waz is None or whz is None:
+        return None
+    if haz < -3:
+        return "STUNTING_BERAT_KOMORBID" if (waz < -2 or whz < -2) else "STUNTING_KRONIS"
+    if haz < -2:
+        return "STUNTING_SEDANG"
+    if whz < -3:
+        return "GIZI_BURUK_AKUT"
+    if whz < -2 or waz < -2:
+        return "GIZI_KURANG_RISIKO"
+    if whz > 1:
+        return "RISIKO_GIZI_LEBIH"
+    return "NORMAL_OPTIMAL"
+
+
 class StuntingResearchPipeline:
     """
     End-to-End Modular Research Pipeline for Child Stunting Analysis.
@@ -112,7 +162,9 @@ class StuntingResearchPipeline:
         shrink_factor: float = 0.3,
         sample_size: int = 1500,
         checkpoint_path: Optional[str] = None,
-        processing_sequence: Optional[List[str]] = None
+        processing_sequence: Optional[List[str]] = None,
+        random_state: int = 42,
+        reference_date: Optional[Any] = None
     ):
         self.n_clusters = int(n_clusters)
         self.n_representatives = int(n_representatives)
@@ -120,6 +172,9 @@ class StuntingResearchPipeline:
         self.sample_size = int(sample_size)
         self.checkpoint_path = checkpoint_path
         self.processing_sequence = processing_sequence or ["cure", "indobert"]
+        self.random_state = int(random_state)
+        # Tanggal ukur acuan untuk menghitung usia dari tanggal lahir bila kolom usia tidak ada
+        self.reference_date = pd.Timestamp(reference_date) if (reference_date and pd is not None) else None
 
         # IndoBERT + RCNN Pipeline
         self.classifier_pipeline: Optional[IndoBERTRCNNPipeline] = None
@@ -176,6 +231,8 @@ class StuntingResearchPipeline:
         weight_kg: Optional[float] = None
         height_cm: Optional[float] = None
         gender: Optional[str] = None
+        dob: Optional[Any] = None
+        position: Optional[str] = None
         notes: List[str] = []
         ground_truth: Optional[str] = None
 
@@ -228,6 +285,15 @@ class StuntingResearchPipeline:
                 elif "P" in s_gen or "WANITA" in s_gen or "PEREMPUAN" in s_gen:
                     gender = "P"
 
+            # Date of birth (e-PPGBM: "Tgl Lahir") and measurement position ("Cara Ukur")
+            elif any(term in k for term in ["tgl_lahir", "tanggal_lahir"]):
+                ts = pd.to_datetime(v, errors="coerce") if pd is not None else None
+                dob = None if ts is None or pd.isna(ts) else ts
+            elif any(term in k for term in ["cara_ukur", "posisi"]):
+                s_pos = str(v).strip().lower()
+                position = "Terlentang" if ("terlentang" in s_pos or "telentang" in s_pos) else (
+                    "Berdiri" if "berdiri" in s_pos else None)
+
             # Clinical notes / observations
             elif any(term in k for term in ["catatan", "keterangan", "keluhan", "diagnosa", "riwayat", "notes"]):
                 notes.append(str(v).strip())
@@ -235,6 +301,12 @@ class StuntingResearchPipeline:
             # Independent Ground Truth column
             elif any(term in k for term in ["label_manual", "ground_truth", "target_stunting", "diagnosis_dokter"]):
                 ground_truth = str(v).strip()
+
+        # Usia dihitung dari tanggal lahir bila tidak ada kolom usia (data e-PPGBM)
+        if age_months is None and dob is not None and self.reference_date is not None:
+            days = (self.reference_date - dob).days
+            if 0 <= days <= 1826:
+                age_months = round(days / 30.4375, 2)
 
         # NOTE: In accordance with research methodology Task 3, unsupported polynomial
         # approximations for HAZ and WAZ have been completely removed.
@@ -248,6 +320,7 @@ class StuntingResearchPipeline:
             "height_cm": height_cm,
             "weight_kg": weight_kg,
             "gender": gender,
+            "position": position,
             "notes": " ".join(notes).strip(),
             "ground_truth": ground_truth
         }
@@ -318,7 +391,7 @@ class StuntingResearchPipeline:
         processed_sheets_summary = []
         total_rows_all = 0
 
-        with pd.ExcelWriter(str(output_p), engine="openpyxl") as writer:
+        with excel_file, pd.ExcelWriter(str(output_p), engine="openpyxl") as writer:
             for s_name in sheet_names:
                 df_raw = pd.read_excel(excel_file, sheet_name=s_name, header=None)
                 if df_raw.empty or len(df_raw) < 2:
@@ -338,6 +411,10 @@ class StuntingResearchPipeline:
 
                 # Extract indicators
                 indicators_list = [self._extract_indicators(row) for _, row in data_rows.iterrows()]
+                # Data e-PPGBM tidak memiliki catatan teks: susun narasi antropometri
+                for i, ind in enumerate(indicators_list):
+                    if not ind["notes"]:
+                        ind["notes"] = build_note(ind, template_idx=i)
 
                 # Build numerical feature matrix for CURE: [HAZ, WAZ, WHZ, normalized_age]
                 # Methodological Rule (Task 4):
@@ -377,14 +454,22 @@ class StuntingResearchPipeline:
                         n_representatives=self.n_representatives,
                         shrink_factor=self.shrink_factor
                     )
-                    fitted_labels = clusterer.fit_predict(cure_features)
+                    # CURE (Guha et al., 1998): tahap hierarkis pada sampel acak berukuran
+                    # sample_size, lalu seluruh data diberi label ke titik representatif terdekat.
+                    if n_complete > self.sample_size:
+                        rng = np.random.default_rng(self.random_state)
+                        sample_idx = np.sort(rng.choice(n_complete, self.sample_size, replace=False))
+                        clusterer.fit([cure_features[i] for i in sample_idx])
+                        fitted_labels = [int(x) for x in clusterer.predict(cure_features)]
+                    else:
+                        fitted_labels = [int(x) for x in clusterer.fit_predict(cure_features)]
 
                     for orig_idx, clab in zip(valid_cure_indices, fitted_labels):
                         cure_labels[orig_idx] = int(clab)
 
                     # Evaluate clustering strictly on the standardized feature matrix produced by CURE
                     scaled_matrix = clusterer.X_scaled_
-                    clustering_eval = evaluate_clustering(scaled_matrix, fitted_labels)
+                    clustering_eval = evaluate_clustering(scaled_matrix, clusterer.labels_)
                 else:
                     logger.warning(
                         "Sheet '%s': only %d complete observations; minimum 2 required for CURE clustering.",
@@ -404,9 +489,25 @@ class StuntingResearchPipeline:
                 cluster_label_map: Dict[int, str] = {}
                 cluster_conf_map: Dict[int, Optional[float]] = {}
 
+                notes_texts = [ind["notes"] for ind in indicators_list]
+                record_preds_raw: Optional[List[Dict[str, Any]]] = None
                 if self.classifier_pipeline and self.classifier_pipeline.is_loaded and self.classifier_pipeline.is_trained:
                     try:
-                        cluster_semantic_labels = self.classifier_pipeline.label_all_clusters(cluster_notes_map)
+                        record_preds_raw = self.classifier_pipeline.predict(notes_texts)
+                    except Exception as e:
+                        logger.error("IndoBERT record-level inference error on sheet %s: %s", s_name, e)
+
+                if record_preds_raw is not None:
+                    try:
+                        cluster_preds_map: Dict[int, List[Dict[str, Any]]] = {}
+                        for orig_idx, clab in zip(valid_cure_indices, fitted_labels if n_complete >= 2 else []):
+                            if notes_texts[orig_idx].strip():
+                                cluster_preds_map.setdefault(int(clab), []).append(record_preds_raw[orig_idx])
+                        cluster_semantic_labels = {
+                            cid: self.classifier_pipeline.label_cluster(
+                                cluster_notes_map[cid], cluster_id=cid, predictions=cluster_preds_map.get(cid, []))
+                            for cid in cluster_notes_map
+                        }
                         for cid, info in cluster_semantic_labels.items():
                             cluster_label_map[cid] = info["cluster_label"]
                             cluster_conf_map[cid] = info["confidence"]
@@ -425,20 +526,16 @@ class StuntingResearchPipeline:
                 cluster_conf_map[-1] = None
 
                 # Individual record-level IndoBERT + RCNN inference (distinguished from cluster-level label)
-                notes_texts = [ind["notes"] for ind in indicators_list]
                 indobert_record_preds: List[str] = []
                 indobert_record_confs: List[Optional[float]] = []
 
-                if self.classifier_pipeline and self.classifier_pipeline.is_loaded and self.classifier_pipeline.is_trained:
-                    try:
-                        preds = self.classifier_pipeline.predict(notes_texts)
-                        for p in preds:
-                            indobert_record_preds.append(p["label_description"])
-                            indobert_record_confs.append(p["confidence"])
-                    except Exception as e:
-                        logger.error("IndoBERT record-level inference error on sheet %s: %s", s_name, e)
-                        indobert_record_preds = ["Error Inference IndoBERT"] * N
-                        indobert_record_confs = [None] * N
+                if record_preds_raw is not None:
+                    for p in record_preds_raw:
+                        indobert_record_preds.append(p["label_description"])
+                        indobert_record_confs.append(p["confidence"])
+                elif self.classifier_pipeline and self.classifier_pipeline.is_trained:
+                    indobert_record_preds = ["Error Inference IndoBERT"] * N
+                    indobert_record_confs = [None] * N
                 else:
                     indobert_record_preds = ["Model Belum Dilatih / Checkpoint Tidak Tersedia"] * N
                     indobert_record_confs = [None] * N
@@ -461,6 +558,12 @@ class StuntingResearchPipeline:
 
                 # Assemble enriched DataFrame with explicit separation between Cluster_ID and Cluster_Label
                 df_out = data_rows.copy()
+                df_out["Usia_Bulan_Dihitung"] = [ind["age_months"] for ind in indicators_list]
+                df_out["Catatan_Input_IndoBERT"] = notes_texts
+                df_out["Kategori_Permenkes_7Kelas"] = [
+                    DEFAULT_LABEL_DESCRIPTIONS.get(permenkes_reference_label(ind["haz"], ind["waz"], ind["whz"]), "Indikator Tidak Lengkap")
+                    for ind in indicators_list
+                ]
                 df_out["CURE_Cluster_ID"] = cure_labels
                 df_out["CURE_Cluster_Label"] = [cluster_label_map.get(cid, f"Klaster {cid}") for cid in cure_labels]
                 df_out["Cluster_Label_Confidence"] = [cluster_conf_map.get(cid, None) for cid in cure_labels]
@@ -517,7 +620,8 @@ class StuntingResearchPipeline:
             "cure_parameters": {
                 "n_clusters": self.n_clusters,
                 "n_representatives": self.n_representatives,
-                "shrink_factor": self.shrink_factor
+                "shrink_factor": self.shrink_factor,
+                "sample_size": self.sample_size
             },
             "processing_sequence": self.processing_sequence
         }
