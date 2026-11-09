@@ -210,6 +210,22 @@ export function rowIssues(haz: number | null, waz: number | null, whz: number | 
   return issues;
 }
 
+/**
+ * Peringatan bila >= 10% baris lembar keluar karena usia di luar 0-60 bulan padahal usia dihitung
+ * dari Tgl Lahir terhadap tanggal acuan (berkas tanpa kolom usia/tanggal ukur). Tanda khas tanggal acuan
+ * dibiarkan "hari ini" untuk data lama: usia membengkak dan banyak balita terbuang.
+ */
+export function referenceDateWarning(sheet: SheetResult, referenceDate: string): string | null {
+  if (!sheet.ageSource.includes('tanggal acuan') || sheet.inputRows === 0) return null;
+  const n = sheet.excluded.filter(e => e.reasons.some(r => r.startsWith('Usia ') && r.includes('di luar rentang balita'))).length;
+  if (n / sheet.inputRows < 0.1) return null;
+  return `Lembar ${sheet.sheetName}: ${n.toLocaleString('id-ID')} dari ${sheet.inputRows.toLocaleString('id-ID')} baris ` +
+    `(${Math.round((100 * n) / sheet.inputRows)}%) dikeluarkan karena usia di luar 0-60 bulan. Berkas tidak punya kolom ` +
+    `tanggal ukur, jadi usia dihitung dari Tgl Lahir terhadap tanggal acuan ${referenceDate}. Bila pengukuran dilakukan ` +
+    `sebelum tanggal itu, usia anak terhitung terlalu tua. Isi tanggal acuan dengan tanggal pengukuran atau tambahkan ` +
+    `kolom Tgl Ukur pada berkas, lalu jalankan ulang analisis.`;
+}
+
 /** Cermin pipeline.permenkes_reference_label (ambang Permenkes 2/2020, prioritas TB/U). */
 export function permenkesKey(haz: number, waz: number, whz: number): string {
   if (haz < -3) return waz < -2 || whz < -2 ? 'STUNTING_BERAT_KOMORBID' : 'STUNTING_KRONIS';
@@ -628,6 +644,7 @@ export function exportResultToExcel(result: PipelineResult): ArrayBuffer {
       [`[${s.sheetName}] Baris dianalisis / dikeluarkan`, `${s.rowCount} / ${s.excluded.length}`],
       [`[${s.sheetName}] Purity vs ${RULE_LABEL_TITLE} (%)`, s.purityScore ?? '-'],
       [`[${s.sheetName}] Silhouette`, s.silhouette ?? '-'],
+      [`[${s.sheetName}] Peringatan tanggal acuan`, referenceDateWarning(s, p.referenceDate) ?? '-'],
     ] as [string, string | number][]),
   ];
   XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet([['Metrik', 'Nilai'], ...summary]), 'Ringkasan');

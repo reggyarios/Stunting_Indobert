@@ -33,6 +33,7 @@ import {
   hasExcelSignature,
   fromServerResponse,
   interpretSheet,
+  referenceDateWarning,
   createBenchmarkWorkbook,
   exportResultToExcel
 } from '@/lib/stunting-pipeline';
@@ -276,6 +277,9 @@ export default function CureIndoBertStuntingPage() {
   const labelTitle = pipelineResult?.labelTitle ?? RULE_LABEL_TITLE;
   const showConfidence = Boolean(pipelineResult?.indobertActive);
   const totalExcluded = pipelineResult?.sheets.reduce((a, s) => a + s.excluded.length, 0) ?? 0;
+  const dateWarnings = pipelineResult
+    ? pipelineResult.sheets.map(s => referenceDateWarning(s, pipelineResult.cureParams.referenceDate)).filter((w): w is string => w !== null)
+    : [];
   const trailingColumns = useMemo(
     () => currentSheet?.columns.filter(c => !DEDICATED_COLUMNS.has(c) && c !== labelField) ?? [],
     [currentSheet, labelField]
@@ -760,6 +764,17 @@ export default function CureIndoBertStuntingPage() {
                 <div className="text-[11px] text-[#7d907f] mt-0.5">Permenkes No 2/2020</div>
               </div>
             </div>
+
+            {/* Tanggal acuan kemungkinan salah: banyak balita keluar karena usia */}
+            {dateWarnings.length > 0 && (
+              <div role="alert" className="p-3.5 rounded-lg border border-[#ebd0d0] bg-[#fdf5f5] text-xs text-[#912d2d] space-y-1.5">
+                <div className="flex items-center gap-2 font-semibold">
+                  <AlertTriangle className="w-4 h-4 shrink-0" />
+                  <span>Periksa tanggal acuan usia: hasil ini kemungkinan tidak valid</span>
+                </div>
+                {dateWarnings.map(w => <p key={w} className="pl-6 leading-relaxed">{w}</p>)}
+              </div>
+            )}
 
             {/* Excluded rows & skipped sheets */}
             {(totalExcluded > 0 || pipelineResult.skippedSheets.length > 0) && (
