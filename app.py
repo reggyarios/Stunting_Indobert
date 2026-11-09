@@ -11,12 +11,16 @@ Production Flask application providing:
 6. Rigorous classification and clustering evaluation on independent ground truth
 """
 
+import gc
 import os
 import sys
+import json
 import uuid
 import secrets
 import logging
-from datetime import datetime
+import tempfile
+from datetime import datetime, date
+from functools import lru_cache
 from pathlib import Path
 from typing import Dict, List, Optional, Any
 
@@ -52,7 +56,7 @@ from indobert_rcnn import (
     IndoBERTRCNNPipeline, ModelNotTrainedError, DEFAULT_LABEL2ID,
     prepare_dataset_splits
 )
-from pipeline import StuntingResearchPipeline
+from pipeline import StuntingResearchPipeline, normalize_column_name, parse_indonesian_numeric
 from evaluation import evaluate_classification, evaluate_clustering
 
 # Configure logging without sensitive PII
@@ -89,6 +93,10 @@ else:
         config = {}
         def route(self, *args, **kwargs):
             return lambda fn: fn
+        errorhandler = route
+
+        def after_request(self, fn):
+            return fn
     app = DummyFlask()
     app.config["SECRET_KEY"] = os.environ.get("SECRET_KEY") or secrets.token_hex(32)
 
@@ -106,6 +114,277 @@ def get_active_checkpoint_path() -> Optional[str]:
     if DEFAULT_CHECKPOINT_PATH.exists():
         return str(DEFAULT_CHECKPOINT_PATH)
     return None
+
+
+@lru_cache(maxsize=1)
+def _load_classifier(path: str, mtime: float) -> Optional[IndoBERTRCNNPipeline]:
+    try:
+        return IndoBERTRCNNPipeline(checkpoint_path=path)
+    except Exception as e:  # checkpoint rusak/tidak cocok: jalan tanpa model, tanpa label palsu
+        logger.warning("Checkpoint IndoBERT tidak dapat dimuat: %s", e)
+        return None
+
+
+def get_classifier() -> Optional[IndoBERTRCNNPipeline]:
+    """Checkpoint dimuat sekali dan dipakai ulang antar-permintaan (dimuat ulang bila berkasnya berubah)."""
+    path = get_active_checkpoint_path()
+    return _load_classifier(path, os.path.getmtime(path)) if path else None
+
+
+# ---------------------------------------------------------------------------
+# Validasi unggahan (dipakai /upload dan /api/analyze)
+# ---------------------------------------------------------------------------
+XLSX_MAGIC = b"PK\x03\x04"
+XLS_MAGIC = b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"
+
+REQUIRED_COLUMNS = {
+    "gender": "JK", "weight": "Berat", "height": "Tinggi",
+    "haz": "ZS TB/U", "waz": "ZS BB/U", "whz": "ZS BB/TB",
+}
+IDENTIFIER_TOKENS = {"nama", "name", "nik", "kk", "alamat", "address", "ibu", "ayah",
+                     "ortu", "wali", "telp", "telepon", "hp"}
+# Rentang wajar balita 0-60 bulan (masih di dalam rentang yang diterima pipeline.py)
+WEIGHT_RANGE_KG = (1.5, 35.0)
+HEIGHT_RANGE_CM = (38.0, 130.0)
+AGE_RANGE_MONTHS = (0.0, 60.0)
+DAYS_PER_MONTH = 30.4375
+MAX_CLUSTERS, MAX_REPRESENTATIVES, MAX_SAMPLE_SIZE = 50, 50, 5000
+
+
+class UploadError(ValueError):
+    """Unggahan/parameter ditolak; pesan berbahasa Indonesia untuk pengguna (HTTP 400)."""
+
+    def __init__(self, message: str, **extra: Any):
+        super().__init__(message)
+        self.extra = extra
+
+
+def column_role(col: Any) -> Optional[str]:
+    """Peran kolom: haz/waz/whz/age/dob/measured/height/weight/gender/identifier atau None."""
+    k = normalize_column_name(col)
+    toks = set(k.split("_"))
+    if toks & IDENTIFIER_TOKENS:
+        return "identifier"
+    if toks & {"status", "kategori"}:
+        return None
+    is_z = bool(toks & {"zs", "zscore", "z"})
+    if "haz" in toks or (is_z and ("tb_u" in k or "pb_u" in k)):
+        return "haz"
+    if "waz" in toks or (is_z and "bb_u" in k):
+        return "waz"
+    if "whz" in toks or (is_z and ("bb_tb" in k or "bb_pb" in k)):
+        return "whz"
+    if any(p in k for p in ("tb_u", "pb_u", "bb_u", "bb_tb", "bb_pb")):
+        return None  # kolom status teks (TB/U, BB/U, BB/TB)
+    if toks & {"tgl", "tanggal"}:
+        if toks & {"lahir", "lhr"}:
+            return "dob"
+        if toks & {"ukur", "timbang", "pengukuran", "kunjungan"}:
+            return "measured"
+        return None
+    if toks & {"usia", "umur"}:
+        return "age"
+    if toks & {"tinggi", "panjang", "tb", "pb"}:
+        return "height"
+    if toks & {"berat", "bb"}:
+        return "weight"
+    if toks & {"jk", "gender", "sex"} or "jenis_kelamin" in k:
+        return "gender"
+    return None
+
+
+def _parse_gender(v: Any) -> Optional[str]:
+    # Sama dengan aturan pipeline._extract_indicators
+    if v is None or (isinstance(v, float) and v != v):
+        return None
+    s = str(v).strip().upper()
+    if "L" in s or "PRIA" in s or "LAKI" in s:
+        return "L"
+    if "P" in s or "WANITA" in s or "PEREMPUAN" in s:
+        return "P"
+    return None
+
+
+def _to_timestamp(v: Any):
+    ts = pd.to_datetime(v, errors="coerce")
+    return None if pd.isna(ts) else ts
+
+
+def row_issues(haz, waz, whz, weight, height, age, gender) -> List[str]:
+    """Alasan baris dikeluarkan: data tidak lengkap, WHO flag, atau ukuran tidak wajar."""
+    missing = [label for label, v in (("JK", gender), ("Berat", weight), ("Tinggi", height),
+                                      ("ZS TB/U", haz), ("ZS BB/U", waz), ("ZS BB/TB", whz),
+                                      ("Usia/Tgl Lahir", age)) if v is None]
+    issues = [f"Data tidak lengkap/tidak terbaca: {', '.join(missing)}"] if missing else []
+    if haz is not None and abs(haz) > 6:
+        issues.append(f"ZS TB/U {haz:g} di luar batas WHO (|z| > 6)")
+    if waz is not None and not (-6 <= waz <= 5):
+        issues.append(f"ZS BB/U {waz:g} di luar batas WHO (-6 s.d. +5)")
+    if whz is not None and abs(whz) > 5:
+        issues.append(f"ZS BB/TB {whz:g} di luar batas WHO (|z| > 5)")
+    if weight is not None and not (WEIGHT_RANGE_KG[0] <= weight <= WEIGHT_RANGE_KG[1]):
+        issues.append(f"Berat {weight:g} kg di luar rentang wajar ({WEIGHT_RANGE_KG[0]:g}-{WEIGHT_RANGE_KG[1]:g} kg)")
+    if height is not None and not (HEIGHT_RANGE_CM[0] <= height <= HEIGHT_RANGE_CM[1]):
+        issues.append(f"Tinggi {height:g} cm di luar rentang wajar ({HEIGHT_RANGE_CM[0]:g}-{HEIGHT_RANGE_CM[1]:g} cm)")
+    if age is not None and not (AGE_RANGE_MONTHS[0] <= age <= AGE_RANGE_MONTHS[1]):
+        issues.append(f"Usia {age:g} bulan di luar rentang balita 0-60 bulan (periksa tanggal acuan)")
+    return issues
+
+
+def parse_analysis_params(form: Any) -> Dict[str, Any]:
+    try:
+        params = {
+            "n_clusters": int(form.get("n_clusters", 4)),
+            "n_representatives": int(form.get("n_representatives", 5)),
+            "shrink_factor": float(form.get("shrink_factor", 0.3)),
+            "sample_size": int(form.get("sample_size", 1500)),
+        }
+    except (TypeError, ValueError):
+        raise UploadError("Parameter CURE harus berupa angka.")
+    if not (1 <= params["n_clusters"] <= MAX_CLUSTERS and 1 <= params["n_representatives"] <= MAX_REPRESENTATIVES
+            and 0.0 <= params["shrink_factor"] <= 1.0 and 2 <= params["sample_size"] <= MAX_SAMPLE_SIZE):
+        raise UploadError(f"Parameter CURE di luar rentang: 1 <= k <= {MAX_CLUSTERS}, 1 <= c <= {MAX_REPRESENTATIVES}, "
+                          f"0 <= alpha <= 1, 2 <= ukuran sampel <= {MAX_SAMPLE_SIZE}.")
+    ref = (form.get("reference_date") or "").strip()
+    try:
+        params["reference_date"] = date.fromisoformat(ref) if ref else date.today()
+    except ValueError:
+        raise UploadError("Tanggal acuan harus berformat YYYY-MM-DD.")
+    return params
+
+
+def _read_raw_sheets(path: Path) -> Dict[str, Any]:
+    with open(path, "rb") as fh:
+        head = fh.read(8)
+    if not (head.startswith(XLSX_MAGIC) or head.startswith(XLS_MAGIC)):
+        raise UploadError("Isi berkas bukan workbook Excel (.xlsx/.xls). Berkas mungkin rusak, "
+                          "atau berupa CSV/PDF/berkas lain yang diganti ekstensinya.")
+    try:
+        with pd.ExcelFile(str(path)) as xf:
+            return {s: pd.read_excel(xf, sheet_name=s, header=None) for s in xf.sheet_names}
+    except ImportError:
+        raise UploadError("Server belum mendukung format .xls lama (paket xlrd tidak terpasang). "
+                          "Simpan ulang berkas sebagai .xlsx lalu unggah kembali.")
+    except Exception:
+        raise UploadError("Workbook Excel tidak dapat dibaca: berkas rusak, terenkripsi, atau bukan berkas Excel.")
+
+
+def prepare_workbook(src_path: Path, clean_path: Path, reference_date: date) -> Dict[str, Any]:
+    """
+    Validasi workbook lalu tulis salinan bersih untuk pipeline: kolom identitas (nama/NIK/alamat)
+    dibuang, baris tidak lengkap / WHO flag / ukuran tidak wajar dikeluarkan dan dilaporkan.
+    """
+    raw_sheets = _read_raw_sheets(src_path)
+    detector = StuntingResearchPipeline()
+    ref_ts = pd.Timestamp(reference_date)
+    sheets, skipped, cleaned = [], [], {}
+    any_data, valid_sheets = False, 0
+
+    for s_name, df_raw in raw_sheets.items():
+        if df_raw.empty or len(df_raw) < 2:
+            skipped.append({"sheet_name": s_name, "reason": "Lembar kosong"})
+            continue
+        header_idx = detector._detect_header_row(df_raw)
+        headers, seen = [], {}
+        for c in df_raw.iloc[header_idx]:
+            h = str(c).strip()
+            seen[h] = seen.get(h, 0) + 1
+            headers.append(h if seen[h] == 1 else f"{h}_{seen[h]}")
+        data = df_raw.iloc[header_idx + 1:].copy()
+        data.columns = headers
+        data = data.dropna(how="all")
+        if data.empty:
+            skipped.append({"sheet_name": s_name, "reason": "Tidak ada baris data balita"})
+            continue
+        any_data = True
+
+        role_col: Dict[str, str] = {}
+        for h in headers:
+            role = column_role(h)
+            if role and role != "identifier":
+                role_col.setdefault(role, h)
+        missing = [label for role, label in REQUIRED_COLUMNS.items() if role not in role_col]
+        if "age" not in role_col and "dob" not in role_col:
+            missing.append("Usia (bulan) atau Tgl Lahir")
+        if missing:
+            skipped.append({"sheet_name": s_name, "reason": "Kolom wajib tidak ditemukan: " + ", ".join(missing)})
+            continue
+        valid_sheets += 1
+
+        use_measured = "age" not in role_col and "measured" in role_col
+        age_source = ("kolom usia" if "age" in role_col else
+                      "Tgl Lahir terhadap kolom tanggal ukur" if use_measured else
+                      f"Tgl Lahir terhadap tanggal acuan {reference_date.isoformat()}")
+        num = lambda row, role: parse_indonesian_numeric(row[role_col[role]])
+        keep, excluded, ages = [], [], []
+        for idx, row in data.iterrows():
+            if "age" in role_col:
+                age = num(row, "age")
+            else:
+                dob = _to_timestamp(row[role_col["dob"]])
+                ref = (_to_timestamp(row[role_col["measured"]]) if use_measured else None) or ref_ts
+                age = round((ref - dob).days / DAYS_PER_MONTH, 2) if dob is not None else None
+            issues = row_issues(num(row, "haz"), num(row, "waz"), num(row, "whz"), num(row, "weight"),
+                                num(row, "height"), age, _parse_gender(row[role_col["gender"]]))
+            keep.append(not issues)
+            ages.append(age)
+            if issues:
+                excluded.append({"row": int(idx) + 1, "reasons": issues})
+
+        clean = data.loc[keep, [h for h in headers if column_role(h) != "identifier"]].copy()
+        if use_measured:
+            clean["Usia_Bulan_Saat_Ukur"] = [a for a, k in zip(ages, keep) if k]
+        clean.insert(0, "Baris_Excel", [int(i) + 1 for i, k in zip(data.index, keep) if k])
+        if not len(clean):
+            skipped.append({"sheet_name": s_name, "reason": f"Semua {len(excluded)} baris dikeluarkan saat validasi "
+                            f"(contoh baris {excluded[0]['row']}: {'; '.join(excluded[0]['reasons'])})"})
+            continue
+        sheets.append({"sheet_name": s_name, "input_rows": len(data), "valid_rows": len(clean),
+                       "excluded_rows": excluded, "age_source": age_source})
+        cleaned[s_name[:31]] = clean
+
+    if not any_data:
+        raise UploadError("Tidak ada data balita pada berkas ini.", skipped_sheets=skipped)
+    if not valid_sheets:
+        raise UploadError("Tidak ada lembar dengan kolom wajib (JK, Berat, Tinggi, ZS TB/U, ZS BB/U, ZS BB/TB, "
+                          "serta Usia atau Tgl Lahir). Data tidak diberi label.", skipped_sheets=skipped)
+    if not cleaned:
+        raise UploadError("Tidak ada data balita yang lolos validasi (semua baris tidak lengkap atau tidak wajar).",
+                          skipped_sheets=skipped)
+
+    with pd.ExcelWriter(str(clean_path), engine="openpyxl") as writer:
+        for name, df in cleaned.items():
+            df.to_excel(writer, sheet_name=name, index=False)
+    return {"sheets": sheets, "skipped_sheets": skipped}
+
+
+def run_analysis(src_path: Path, clean_path: Path, output_path: Path, params: Dict[str, Any]) -> Dict[str, Any]:
+    """Validasi + CURE + IndoBERT-RCNN (bila checkpoint ada). Melempar UploadError untuk input buruk."""
+    prep = prepare_workbook(src_path, clean_path, params["reference_date"])
+    pipeline = StuntingResearchPipeline(
+        n_clusters=params["n_clusters"],
+        n_representatives=params["n_representatives"],
+        shrink_factor=params["shrink_factor"],
+        sample_size=params["sample_size"],
+        checkpoint_path=None,
+        reference_date=params["reference_date"].isoformat(),
+    )
+    pipeline.classifier_pipeline = get_classifier()
+    summary = pipeline.process_excel(clean_path, output_path)
+    # process_excel tidak menutup pd.ExcelFile; lepaskan handle agar salinan data sementara
+    # benar-benar terhapus (di Windows berkas yang masih terbuka tidak bisa dihapus).
+    gc.collect()
+    clf = pipeline.classifier_pipeline
+    return {"summary": summary, "prep": prep, "indobert_active": bool(clf and clf.is_trained)}
+
+
+def _json_response(obj: Any, status: int = 200):
+    body = json.dumps(obj, ensure_ascii=False, default=lambda o: o.item() if hasattr(o, "item") else str(o))
+    return app.response_class(body, status=status, mimetype="application/json")
+
+
+def _api_error(message: str, status: int = 400, **extra: Any):
+    return _json_response({"status": "error", "message": message, **extra}, status)
 
 
 @app.route("/", methods=["GET"])
@@ -134,31 +413,20 @@ def upload_file():
     job_id = str(uuid.uuid4())
     safe_name = secure_filename(file.filename) or "stunting_dataset.xlsx"
     upload_path = UPLOAD_DIR / f"{job_id}_{safe_name}"
+    clean_path = UPLOAD_DIR / f"{job_id}_validated.xlsx"
     file.save(str(upload_path))
 
-    # Read hyperparameters from form
-    try:
-        n_clusters = int(request.form.get("n_clusters", 4))
-        n_representatives = int(request.form.get("n_representatives", 5))
-        shrink_factor = float(request.form.get("shrink_factor", 0.3))
-        sample_size = int(request.form.get("sample_size", 1500))
-    except (ValueError, TypeError):
-        n_clusters, n_representatives, shrink_factor, sample_size = 4, 5, 0.3, 1500
-
-    output_filename = f"CURE_IndoBERT_Enriched_{safe_name}"
+    output_filename = f"CURE_IndoBERT_Enriched_{Path(safe_name).stem}.xlsx"
     output_path = OUTPUT_DIR / f"{job_id}_{output_filename}"
 
-    checkpoint_path = get_active_checkpoint_path()
-
     try:
-        pipeline = StuntingResearchPipeline(
-            n_clusters=n_clusters,
-            n_representatives=n_representatives,
-            shrink_factor=shrink_factor,
-            sample_size=sample_size,
-            checkpoint_path=checkpoint_path
-        )
-        metrics = pipeline.process_excel(upload_path, output_path)
+        params = parse_analysis_params(request.form)
+        result = run_analysis(upload_path, clean_path, output_path, params)
+        metrics = result["summary"]
+        metrics["excluded_rows_total"] = sum(len(s["excluded_rows"]) for s in result["prep"]["sheets"])
+        metrics["skipped_sheets"] = result["prep"]["skipped_sheets"]
+        metrics["reference_date"] = params["reference_date"].isoformat()
+        metrics["indobert_active"] = result["indobert_active"]
         metrics["job_id"] = job_id
         metrics["original_filename"] = safe_name
         metrics["output_filename"] = output_filename
@@ -177,11 +445,92 @@ def upload_file():
 
         return redirect(url_for("view_result", job_id=job_id))
 
+    except UploadError as e:
+        flash(str(e), "error")
+        return redirect(url_for("index"))
     except Exception as e:
         logger.exception("Pipeline failure on job %s: %s", job_id, str(e))
         # User-friendly message without exposing internal system paths
-        flash(f"Terjadi kesalahan saat memproses data: {str(e)}", "error")
+        flash("Terjadi kesalahan internal saat memproses data.", "error")
         return redirect(url_for("index"))
+    finally:
+        # Data balita mentah tidak disimpan setelah diproses (UU 27/2022 PDP)
+        for p in (upload_path, clean_path):
+            try:
+                p.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+
+@app.route("/api/analyze", methods=["POST"])
+def api_analyze():
+    """
+    JSON API untuk front end Next.js. multipart: file, n_clusters, n_representatives,
+    shrink_factor, sample_size, reference_date (YYYY-MM-DD). Baris hasil TANPA kolom identitas.
+    """
+    file = request.files.get("file")
+    if file is None or not file.filename:
+        return _api_error("Berkas tidak ditemukan. Kirim berkas Excel pada field 'file'.")
+    if not allowed_file(file.filename):
+        return _api_error("Format berkas tidak didukung. Unggah berkas Excel .xlsx atau .xls.")
+
+    try:
+        params = parse_analysis_params(request.form)
+        with tempfile.TemporaryDirectory(prefix="stunting_", ignore_cleanup_errors=True) as tmp:
+            tmp_dir = Path(tmp)
+            src = tmp_dir / ("unggahan." + file.filename.rsplit(".", 1)[1].lower())
+            file.save(str(src))
+            out = tmp_dir / "hasil.xlsx"
+            result = run_analysis(src, tmp_dir / "tervalidasi.xlsx", out, params)
+            out_sheets = pd.read_excel(str(out), sheet_name=None)
+    except UploadError as e:
+        return _api_error(str(e), **e.extra)
+    except Exception:
+        logger.exception("api_analyze gagal")
+        return _api_error("Terjadi kesalahan internal saat memproses data.", status=500)
+
+    sheets = []
+    for info in result["prep"]["sheets"]:
+        df = out_sheets.get(info["sheet_name"][:31])
+        if df is None:
+            continue
+        df = df[[c for c in df.columns if column_role(c) != "identifier"]]
+        split = json.loads(df.to_json(orient="split", index=False, date_format="iso"))
+        sheets.append({**info, "columns": split["columns"], "rows": split["data"]})
+
+    return _json_response({
+        "status": "success",
+        "indobert_active": result["indobert_active"],
+        "reference_date": params["reference_date"].isoformat(),
+        "summary": result["summary"],
+        "sheets": sheets,
+        "skipped_sheets": result["prep"]["skipped_sheets"],
+    })
+
+
+@app.after_request
+def add_cors_headers(response):
+    """CORS sederhana untuk /api/*. ALLOWED_ORIGINS: daftar origin dipisah koma (default '*')."""
+    if request.path.startswith("/api/"):
+        allowed = [o.strip() for o in os.environ.get("ALLOWED_ORIGINS", "*").split(",") if o.strip()]
+        origin = request.headers.get("Origin")
+        if "*" in allowed:
+            response.headers["Access-Control-Allow-Origin"] = "*"
+        elif origin in allowed:
+            response.headers["Access-Control-Allow-Origin"] = origin
+            response.headers["Vary"] = "Origin"
+        response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+        response.headers["Access-Control-Allow-Headers"] = "Content-Type"
+    return response
+
+
+@app.errorhandler(413)
+def too_large(_e):
+    msg = "Ukuran berkas melebihi batas 64 MB."
+    if request.path.startswith("/api/"):
+        return _api_error(msg, status=413)
+    flash(msg, "error")
+    return redirect(url_for("index"))
 
 
 @app.route("/result/<job_id>", methods=["GET"])
@@ -240,9 +589,11 @@ def load_benchmark():
         n_clusters=4,
         n_representatives=5,
         shrink_factor=0.3,
-        checkpoint_path=get_active_checkpoint_path()
+        checkpoint_path=None
     )
+    pipeline.classifier_pipeline = get_classifier()
     metrics = pipeline.process_excel(sample_path, output_path)
+    metrics["indobert_active"] = bool(pipeline.classifier_pipeline and pipeline.classifier_pipeline.is_trained)
     metrics["job_id"] = job_id
     metrics["original_filename"] = "Demonstration_Synthetic_Stunting_Data.xlsx"
     metrics["output_filename"] = output_filename
@@ -338,7 +689,7 @@ def health_check():
         "timestamp": datetime.utcnow().isoformat(),
         "active_jobs": len(JOB_STORE),
         "has_trained_checkpoint": has_checkpoint,
-        "checkpoint_path": str(DEFAULT_CHECKPOINT_PATH) if has_checkpoint else None
+        "checkpoint_path": DEFAULT_CHECKPOINT_PATH.name if has_checkpoint else None  # tanpa path absolut server
     })
 
 

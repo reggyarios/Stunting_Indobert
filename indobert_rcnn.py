@@ -38,7 +38,7 @@ DEFAULT_LABEL2ID: Dict[str, int] = {
 DEFAULT_ID2LABEL: Dict[int, str] = {v: k for k, v in DEFAULT_LABEL2ID.items()}
 
 DEFAULT_LABEL_DESCRIPTIONS: Dict[str, str] = {
-    "STUNTING_BERAT_KOMORBID": "Stunting Berat dengan Komorbiditas Klinis",
+    "STUNTING_BERAT_KOMORBID": "Stunting Berat dengan Komorbiditas Antropometri",
     "STUNTING_KRONIS": "Stunting Kronis / Sangat Pendek (HAZ < -3 SD)",
     "STUNTING_SEDANG": "Stunting Sedang / Pendek (-3 SD <= HAZ < -2 SD)",
     "GIZI_BURUK_AKUT": "Gizi Buruk Akut / Wasting Berat (WHZ < -3 SD)",
@@ -597,7 +597,7 @@ class IndoBERTRCNNPipeline:
 
         return history
 
-    def predict(self, texts: List[str]) -> List[Dict[str, Any]]:
+    def predict(self, texts: List[str], batch_size: int = 64) -> List[Dict[str, Any]]:
         """
         Run inference on clinical note texts.
 
@@ -622,30 +622,34 @@ class IndoBERTRCNNPipeline:
         self.model.to(device)
         self.model.eval()
 
+        empty = {
+            "label_id": -1,
+            "label_key": "UNSPECIFIED",
+            "label_description": "Catatan Klinis Kosong / Tidak Tersedia",
+            "confidence": 0.0,
+            "probabilities": {}
+        }
+        nonempty = [i for i, t in enumerate(cleaned_texts) if t]
+        probs_by_idx: Dict[int, Any] = {}
         with torch.no_grad():
-            for t in cleaned_texts:
-                if not t:
-                    results.append({
-                        "label_id": -1,
-                        "label_key": "UNSPECIFIED",
-                        "label_description": "Catatan Klinis Kosong / Tidak Tersedia",
-                        "confidence": 0.0,
-                        "probabilities": {}
-                    })
-                    continue
-
+            for b in range(0, len(nonempty), batch_size):
+                idxs = nonempty[b:b + batch_size]
                 encoded = self.tokenizer(
-                    t,
+                    [cleaned_texts[i] for i in idxs],
                     truncation=True,
                     padding="max_length",
                     max_length=128,
                     return_tensors="pt"
                 )
-                input_ids = encoded["input_ids"].to(device)
-                attention_mask = encoded["attention_mask"].to(device)
+                logits = self.model(encoded["input_ids"].to(device), encoded["attention_mask"].to(device))
+                for i, row in zip(idxs, F.softmax(logits, dim=-1).cpu().numpy()):
+                    probs_by_idx[i] = row
 
-                logits = self.model(input_ids, attention_mask)
-                probs = F.softmax(logits, dim=-1).squeeze(0).cpu().numpy()
+            for i in range(len(cleaned_texts)):
+                if i not in probs_by_idx:
+                    results.append(dict(empty))
+                    continue
+                probs = probs_by_idx[i]
 
                 best_idx = int(probs.argmax())
                 best_conf = float(probs[best_idx])
@@ -670,7 +674,8 @@ class IndoBERTRCNNPipeline:
     def label_cluster(
         self,
         cluster_texts: List[str],
-        cluster_id: int = 0
+        cluster_id: int = 0,
+        predictions: Optional[List[Dict[str, Any]]] = None
     ) -> Dict[str, Any]:
         """
         Assign an automatic semantic label to a CURE cluster based on member clinical notes.
@@ -713,7 +718,8 @@ class IndoBERTRCNNPipeline:
                 "class_distribution": {}
             }
 
-        predictions = self.predict(valid_texts)
+        if predictions is None:
+            predictions = self.predict(valid_texts)
 
         num_classes = self.num_classes
         sum_probs = {self.id2label[c]: 0.0 for c in range(num_classes)}

@@ -140,3 +140,21 @@ curl -X POST http://localhost:5000/api/train \
 2. **Evaluasi Terpisah**: Evaluasi klasterisasi (Silhouette Score geometri) dipisahkan secara tegas dari evaluasi pelabelan semantik klaster (kemurnian klaster / purity).
 3. **Data Demonstrasi**: Berkas contoh pada `/sample-dataset` ditegaskan sebagai **Data Sintetis untuk Pengujian Perangkat Lunak**, bukan data klinis riil.
 4. **Rekomendasi Intervensi**: Berupa panduan gizi masyarakat umum berbasis Permenkes RI No. 2/2020, bukan vonis diagnosis atau resep medis perseorangan.
+
+---
+
+## 7. Reproduksi Eksperimen Skripsi (folder `research/`)
+
+Data e-PPGBM bersifat pribadi: **jangan di-commit** (`*.xlsx`, `research/out/`, dan `checkpoints/` sudah ada di `.gitignore`).
+
+```bash
+python research/prepare_data.py "BY NAME BY ADDRESS 2023-2025.xlsx"   # 27.934 rekam bersih + catatan naratif + label acuan 7 kelas
+python research/exp_cure.py 14          # grid CURE (k 2-7, c 5/10, alpha 0,1-0,7) + K-Means, per lembar
+python research/exp_cure_detail.py      # profil konfigurasi kandidat
+python research/exp_time.py             # waktu tahap hierarkis vs ukuran sampel
+python research/exp_indobert.py 3       # IndoBERT-RCNN, TF-IDF+LR, ablasi [CLS] (3 epoch)
+python research/exp_indobert.py 8 rcnn  # IndoBERT-RCNN 8 epoch
+python research/finalize_model.py       # pilih checkpoint akhir
+python research/exp_final.py 6 5 0.5    # pipeline lengkap + evaluasi label klaster
+python research/blackbox.py             # uji black box (Flask :5000 + Next.js :3000)
+```

@@ -1,1358 +1,693 @@
 import * as XLSX from 'xlsx';
+import { cureFit, curePredict, seededSample, silhouetteScore } from './cure';
 
-export interface ChildRecord {
-  [key: string]: any;
-  Cluster_ID?: number;
-  Cluster_Name?: string;
-  CURE_Cluster_ID?: number;
-  CURE_Cluster_Label?: string;
-  Cluster_Label_Confidence?: number;
-  Auto_Label?: string;
-  Label_Confidence?: number;
-  Clinical_Priority?: string;
-  Saran_Asupan_Nutrisi?: string;
-  Tindakan_Medis_Sanitasi?: string;
-  Jadwal_Monitoring?: string;
-  Calculated_HAZ?: number | null;
-  Calculated_WAZ?: number | null;
-  Calculated_WHZ?: number | null;
-  Usia_Bulan?: number | null;
+/**
+ * Dua mode analisis dengan keluaran yang sama bentuknya:
+ * - server: Flask /api/analyze (CURE cure.py + IndoBERT-RCNN bila checkpoint tersedia)
+ * - client: port CURE (lib/cure.ts) + kategori Permenkes berbasis ambang z-score (BUKAN IndoBERT)
+ * Validasi baris/kolom di sini meniru app.py agar kedua mode menolak data yang sama.
+ */
+
+export type ChildRecord = Record<string, any>;
+
+export interface AnalysisParams {
+  k: number;
+  c: number;
+  alpha: number;
+  sampleSize: number;
+  referenceDate: string; // YYYY-MM-DD
+}
+
+export interface ExcludedRow { row: number; reasons: string[] }
+
+export interface ClusterProfile {
+  clusterId: number;
+  name: string;                 // diturunkan dari isi klaster
+  count: number;
+  percentage: number;
+  hazMean: number | null;
+  wazMean: number | null;
+  whzMean: number | null;
+  ageMean: number | null;
+  majorityCategory: string;
+  majorityShare: number;        // %
+  semanticLabel?: string | null;       // konsensus IndoBERT-RCNN (server)
+  semanticConfidence?: number | null;
 }
 
 export interface SheetResult {
   sheetName: string;
+  inputRows: number;
   rowCount: number;
-  columns: string[];
-  featuresUsed: string[];
+  columns: string[];            // seluruh kolom record (urutan ekspor), tanpa kolom identitas
   records: ChildRecord[];
-  clusterDistribution: Record<string, number>;
+  excluded: ExcludedRow[];
+  ageSource: string;
+  clusterProfiles: ClusterProfile[];
   labelDistribution: Record<string, number>;
-  clusterProfiles: {
-    clusterId: number;
-    clusterName: string;
-    count: number;
-    percentage: number;
-    hazMean?: number;
-    wazMean?: number;
-    whzMean?: number;
-    ageMean?: number;
-  }[];
   crosstab: Record<string, Record<string, number>>;
-  purityScore: number;
+  purityScore: number | null;   // terhadap kategori acuan Permenkes
+  silhouette: number | null;
 }
 
 export interface PipelineResult {
+  mode: 'server' | 'client';
+  indobertActive: boolean;
   originalFilename: string;
   totalRows: number;
   processedSheets: number;
-  cureParams: {
-    k: number;
-    c: number;
-    alpha: number;
-  };
+  cureParams: AnalysisParams;
   sheets: SheetResult[];
-  globalClusterDistribution: Record<string, number>;
-  globalLabelDistribution: Record<string, number>;
-  globalCrosstab: Record<string, Record<string, number>>;
-  globalPurityScore: number;
+  skippedSheets: { sheetName: string; reason: string }[];
+  labelField: string;
+  labelTitle: string;
   executionTimestamp: string;
 }
 
-// Indonesian Clinical Stunting Taxonomy (Permenkes RI No. 2/2020 & WHO 2006)
-export const TAXONOMY = {
-  STUNTING_BERAT_KOMORBID: "Stunting Berat dengan Komorbiditas Klinis (Severely Stunted with Comorbidity)",
-  STUNTING_KRONIS: "Stunting Kronis / Sangat Pendek (Chronic Stunting / Severely Stunted)",
-  STUNTING_SEDANG: "Stunting Ringan/Sedang / Pendek (Moderate Stunting / Stunted)",
-  GIZI_BURUK_AKUT: "Gizi Buruk Akut / Wasting Berat (Severe Acute Malnutrition)",
-  GIZI_KURANG_RISIKO: "Gizi Kurang / Risiko Gagal Tumbuh (Wasted / Faltering Growth)",
-  NORMAL_OPTIMAL: "Pertumbuhan Normal / Gizi Optimal (Normal Anthropometry)",
-  RISIKO_GIZI_LEBIH: "Risiko Gizi Lebih / Overweight (Overweight Risk)"
-};
-
-export function normalizeColName(k: string): string {
-  return String(k || '')
-    .toLowerCase()
-    .replace(/[^a-z0-9]/g, '_')
-    .replace(/_+/g, '_')
-    .replace(/^_|_$/g, '');
+export class AnalysisError extends Error {
+  details: string[];
+  constructor(message: string, details: string[] = []) {
+    super(message);
+    this.details = details;
+  }
 }
 
-/**
- * Robust numerical parser that handles:
- * - Indonesian decimal commas: "-2,45" -> -2.45
- * - Unicode minus and dash symbols: "−2.4", "–2.4", "—2.4"
- * - Trailing units: "75.4 cm" -> 75.4, "12,2 kg" -> 12.2, "-2.3 SD" -> -2.3
- */
-export function parseNumericValue(val: any): number | null {
-  if (val === null || val === undefined || val === '') return null;
-  if (typeof val === 'number') return isNaN(val) ? null : val;
-  
-  let str = String(val).trim();
-  if (str === '-' || str === '--' || str === 'null' || str === 'nan') return null;
+// Sama dengan indobert_rcnn.DEFAULT_LABEL_DESCRIPTIONS
+export const PERMENKES_LABELS: Record<string, string> = {
+  STUNTING_BERAT_KOMORBID: 'Stunting Berat dengan Komorbiditas Antropometri',
+  STUNTING_KRONIS: 'Stunting Kronis / Sangat Pendek (HAZ < -3 SD)',
+  STUNTING_SEDANG: 'Stunting Sedang / Pendek (-3 SD <= HAZ < -2 SD)',
+  GIZI_BURUK_AKUT: 'Gizi Buruk Akut / Wasting Berat (WHZ < -3 SD)',
+  GIZI_KURANG_RISIKO: 'Gizi Kurang / Risiko Gagal Tumbuh',
+  NORMAL_OPTIMAL: 'Pertumbuhan Normal / Gizi Optimal',
+  RISIKO_GIZI_LEBIH: 'Risiko Gizi Lebih / Overweight',
+};
+export const RULE_LABEL_FIELD = 'Kategori_Permenkes_7Kelas';
+export const RULE_LABEL_TITLE = 'Kategori Permenkes (aturan ambang)';
+export const MODEL_LABEL_FIELD = 'IndoBERT_Record_Prediksi';
 
-  // Replace unicode minus signs with standard '-'
-  str = str.replace(/[\u2212\u2013\u2014\u2015\uFE63\uFF0D]/g, '-');
-  // Handle Indonesian decimal comma
-  str = str.replace(/,/g, '.');
-  
-  // Extract number with optional leading minus/plus sign
-  const match = str.match(/[-+]?\s*\d*\.?\d+/);
-  if (match) {
-    const cleaned = match[0].replace(/\s+/g, '');
-    const num = parseFloat(cleaned);
-    return isNaN(num) ? null : num;
+const PRIORITY: Record<string, string> = {
+  STUNTING_BERAT_KOMORBID: 'Kritis (Intervensi Medis & Rujukan)',
+  STUNTING_KRONIS: 'Tinggi (Intervensi Gizi Spesifik)',
+  STUNTING_SEDANG: 'Sedang (Pemberian Makanan Tambahan PMT)',
+  GIZI_BURUK_AKUT: 'Kritis (Tatalaksana Gizi Buruk)',
+  GIZI_KURANG_RISIKO: 'Sedang (Pemantauan Kejar Tumbuh)',
+  RISIKO_GIZI_LEBIH: 'Rendah (Pola Makan Seimbang)',
+  NORMAL_OPTIMAL: 'Rendah (Pemantauan Rutin Posyandu)',
+};
+
+// Batas yang sama dengan app.py
+const WEIGHT_RANGE: [number, number] = [1.5, 35];
+const HEIGHT_RANGE: [number, number] = [38, 130];
+const AGE_MAX_MONTHS = 60;
+const DAYS_PER_MONTH = 30.4375;
+const IDENTIFIER_TOKENS = new Set(['nama', 'name', 'nik', 'kk', 'alamat', 'address', 'ibu', 'ayah', 'ortu', 'wali', 'telp', 'telepon', 'hp']);
+const HEADER_KEYWORDS = new Set(['nama', 'balita', 'anak', 'bayi', 'nik', 'no', 'nomor', 'usia', 'umur', 'bulan', 'bln', 'jk', 'gender', 'bb', 'tb',
+  'pb', 'haz', 'waz', 'whz', 'puskesmas', 'posyandu', 'desa', 'berat', 'tinggi', 'panjang', 'catatan', 'keterangan']);
+export const MAX_SAMPLE_SIZE = 3000;
+
+export function normalizeColName(k: unknown): string {
+  return String(k ?? '').trim().toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/_+/g, '_').replace(/^_|_$/g, '');
+}
+
+type Role = 'haz' | 'waz' | 'whz' | 'age' | 'dob' | 'measured' | 'height' | 'weight' | 'gender' | 'identifier' | 'notes' | 'status_tbu' | 'status_bbu' | 'status_bbtb';
+
+const roleCache = new Map<string, Role | null>();
+
+/** Cermin app.column_role (+ kolom catatan & status teks untuk teks saran). */
+export function columnRole(col: unknown): Role | null {
+  const key = String(col ?? '');
+  if (!roleCache.has(key)) roleCache.set(key, computeRole(key));
+  return roleCache.get(key)!;
+}
+
+function computeRole(col: string): Role | null {
+  const k = normalizeColName(col);
+  const toks = new Set(k.split('_'));
+  const has = (...xs: string[]) => xs.some(x => toks.has(x));
+  if ([...toks].some(t => IDENTIFIER_TOKENS.has(t))) return 'identifier';
+  if (has('status', 'kategori')) return null;
+  const isZ = has('zs', 'zscore', 'z');
+  if (toks.has('haz') || (isZ && (k.includes('tb_u') || k.includes('pb_u')))) return 'haz';
+  if (toks.has('waz') || (isZ && k.includes('bb_u'))) return 'waz';
+  if (toks.has('whz') || (isZ && (k.includes('bb_tb') || k.includes('bb_pb')))) return 'whz';
+  if (k === 'tb_u' || k === 'pb_u') return 'status_tbu';
+  if (k === 'bb_u') return 'status_bbu';
+  if (k === 'bb_tb' || k === 'bb_pb') return 'status_bbtb';
+  if (['tb_u', 'pb_u', 'bb_u', 'bb_tb', 'bb_pb'].some(p => k.includes(p))) return null;
+  if (has('tgl', 'tanggal')) {
+    if (has('lahir', 'lhr')) return 'dob';
+    if (has('ukur', 'timbang', 'pengukuran', 'kunjungan')) return 'measured';
+    return null;
   }
+  if (has('usia', 'umur')) return 'age';
+  if (has('tinggi', 'panjang', 'tb', 'pb')) return 'height';
+  if (has('berat', 'bb')) return 'weight';
+  if (has('jk', 'gender', 'sex') || k.includes('jenis_kelamin')) return 'gender';
+  if (['catatan', 'keterangan', 'keluhan', 'diagnosa', 'riwayat', 'notes'].some(t => k.includes(t))) return 'notes';
   return null;
 }
 
-/**
- * Smart Sheet Data Extractor:
- * Real Indonesian Puskesmas / Posyandu / e-PPGBM Excel files frequently have
- * 1-5 title banner rows before the actual table header row (e.g. "TAHUN 2024").
- * This function scans the top rows to automatically detect the genuine header row.
- */
-export function extractDataFromWorksheet(ws: XLSX.WorkSheet): { rawData: Record<string, any>[]; detectedHeaders: string[] } {
-  const rows: any[][] = XLSX.utils.sheet_to_json(ws, { header: 1, defval: '' });
-  if (!rows || rows.length === 0) return { rawData: [], detectedHeaders: [] };
+/** Cermin pipeline.parse_indonesian_numeric: koma desimal, minus unicode, satuan. */
+export function parseNumericValue(val: unknown): number | null {
+  if (val === null || val === undefined || val === '') return null;
+  if (typeof val === 'number') return Number.isFinite(val) ? val : null;
+  let str = String(val).trim();
+  if (['-', '--', 'null', 'nan', 'None', ''].includes(str)) return null;
+  str = str.replace(/[−–—―﹣－]/g, '-').replace(/,/g, '.');
+  const match = str.match(/[-+]?\s*\d*\.?\d+/);
+  if (!match) return null;
+  const num = parseFloat(match[0].replace(/\s+/g, ''));
+  return Number.isFinite(num) ? num : null;
+}
 
-  const headerKeywords = [
-    'nama', 'balita', 'anak', 'bayi', 'nik', 'no', 'nomor',
-    'usia', 'umur', 'bulan', 'bln', 'tgl', 'tanggal', 'lahir', 'ukur',
-    'jk', 'gender', 'jenis_kelamin',
-    'bb', 'berat', 'tb', 'pb', 'tinggi', 'panjang',
-    'haz', 'waz', 'whz', 'zs', 'zscore', 'z_score', 'tb_u', 'bb_u', 'bb_tb',
-    'kec', 'kecamatan', 'puskesmas', 'pukesmas', 'desa', 'kelurahan', 'lila'
-  ];
+function parseGender(v: unknown): 'L' | 'P' | null {
+  if (v === null || v === undefined) return null;
+  const s = String(v).trim().toUpperCase();
+  if (s.includes('L') || s.includes('PRIA') || s.includes('LAKI')) return 'L';
+  if (s.includes('P') || s.includes('WANITA') || s.includes('PEREMPUAN')) return 'P';
+  return null;
+}
 
-  let bestHeaderRowIdx = 0;
-  let maxScore = -1;
+/** Hari sejak 1970-01-01 (UTC) dari serial Excel, Date, 'YYYY-MM-DD[...]' atau 'DD/MM/YYYY'. */
+function toUtcDay(v: unknown): number | null {
+  const ymd = (y: number, m: number, d: number) => {
+    const t = Date.UTC(y, m - 1, d);
+    const dt = new Date(t);
+    return dt.getUTCFullYear() === y && dt.getUTCMonth() === m - 1 && dt.getUTCDate() === d ? t / 86400000 : null;
+  };
+  if (typeof v === 'number') return v >= 1 && v < 2958466 ? Math.floor(v) - 25569 : null;
+  if (v instanceof Date) return isNaN(v.getTime()) ? null : ymd(v.getFullYear(), v.getMonth() + 1, v.getDate());
+  if (typeof v !== 'string') return null;
+  const s = v.trim();
+  let m = s.match(/^(\d{4})-(\d{1,2})-(\d{1,2})/);
+  if (m) return ymd(+m[1], +m[2], +m[3]);
+  m = s.match(/^(\d{1,2})[/-](\d{1,2})[/-](\d{4})$/);
+  if (m) return ymd(+m[3], +m[2], +m[1]);
+  return null;
+}
 
-  const maxScanRows = Math.min(15, rows.length);
-  for (let r = 0; r < maxScanRows; r++) {
-    const row = rows[r];
-    if (!Array.isArray(row) || row.length === 0) continue;
+function dayToIso(day: number): string {
+  return new Date(day * 86400000).toISOString().slice(0, 10);
+}
 
-    let score = 0;
-    for (const cell of row) {
-      if (cell === null || cell === undefined) continue;
-      const cellNorm = normalizeColName(String(cell));
-      if (!cellNorm) continue;
-      // Word token matching to prevent false positives like 'normal' matching 'no'
-      const tokens = cellNorm.split('_');
-      if (tokens.some(t => headerKeywords.includes(t)) || headerKeywords.some(kw => cellNorm === kw)) {
-        score++;
-      }
-    }
+/** Cermin app.row_issues: alasan baris dikeluarkan (pesan sama). */
+export function rowIssues(haz: number | null, waz: number | null, whz: number | null, weight: number | null,
+  height: number | null, age: number | null, gender: string | null): string[] {
+  const missing = ([['JK', gender], ['Berat', weight], ['Tinggi', height], ['ZS TB/U', haz], ['ZS BB/U', waz],
+    ['ZS BB/TB', whz], ['Usia/Tgl Lahir', age]] as const).filter(([, v]) => v === null).map(([l]) => l);
+  const g = (x: number) => String(x);
+  const issues = missing.length ? [`Data tidak lengkap/tidak terbaca: ${missing.join(', ')}`] : [];
+  if (haz !== null && Math.abs(haz) > 6) issues.push(`ZS TB/U ${g(haz)} di luar batas WHO (|z| > 6)`);
+  if (waz !== null && !(waz >= -6 && waz <= 5)) issues.push(`ZS BB/U ${g(waz)} di luar batas WHO (-6 s.d. +5)`);
+  if (whz !== null && Math.abs(whz) > 5) issues.push(`ZS BB/TB ${g(whz)} di luar batas WHO (|z| > 5)`);
+  if (weight !== null && !(weight >= WEIGHT_RANGE[0] && weight <= WEIGHT_RANGE[1]))
+    issues.push(`Berat ${g(weight)} kg di luar rentang wajar (${WEIGHT_RANGE[0]}-${WEIGHT_RANGE[1]} kg)`);
+  if (height !== null && !(height >= HEIGHT_RANGE[0] && height <= HEIGHT_RANGE[1]))
+    issues.push(`Tinggi ${g(height)} cm di luar rentang wajar (${HEIGHT_RANGE[0]}-${HEIGHT_RANGE[1]} cm)`);
+  if (age !== null && !(age >= 0 && age <= AGE_MAX_MONTHS))
+    issues.push(`Usia ${g(age)} bulan di luar rentang balita 0-60 bulan (periksa tanggal acuan)`);
+  return issues;
+}
 
-    if (score > maxScore) {
-      maxScore = score;
-      bestHeaderRowIdx = r;
-    }
+/** Cermin pipeline.permenkes_reference_label (ambang Permenkes 2/2020, prioritas TB/U). */
+export function permenkesKey(haz: number, waz: number, whz: number): string {
+  if (haz < -3) return waz < -2 || whz < -2 ? 'STUNTING_BERAT_KOMORBID' : 'STUNTING_KRONIS';
+  if (haz < -2) return 'STUNTING_SEDANG';
+  if (whz < -3) return 'GIZI_BURUK_AKUT';
+  if (whz < -2 || waz < -2) return 'GIZI_KURANG_RISIKO';
+  if (whz > 1) return 'RISIKO_GIZI_LEBIH';
+  return 'NORMAL_OPTIMAL';
+}
+
+const shortLabel = (s: string) => String(s ?? '-').split(' (')[0];
+const round = (x: number, d: number) => Math.round(x * 10 ** d) / 10 ** d;
+const mean = (xs: number[]) => (xs.length ? xs.reduce((a, b) => a + b, 0) / xs.length : null);
+
+/** Nilai numerik indikator dari record berdasarkan peran kolom (dipakai modal detail). */
+export function roleValue(record: ChildRecord, role: Role): number | null {
+  for (const [k, v] of Object.entries(record)) if (columnRole(k) === role) return parseNumericValue(v);
+  return null;
+}
+
+// ---------------------------------------------------------------------------
+// Saran gizi umum (mode tanpa server) — panduan umum berbasis kategori, bukan diagnosis
+// ---------------------------------------------------------------------------
+function recommendations(key: string, age: number, haz: number, waz: number, whz: number, height: number, weight: number,
+  gender: 'L' | 'P' | null, notes: string, st: { tbu: string; bbu: string; bbtb: string }) {
+  const isSevere = key === 'STUNTING_BERAT_KOMORBID' || key === 'STUNTING_KRONIS' || key === 'GIZI_BURUK_AKUT';
+  const isModerate = key === 'STUNTING_SEDANG' || key === 'GIZI_KURANG_RISIKO';
+  const isOverweight = key === 'RISIKO_GIZI_LEBIH';
+  const isUnderweight = waz < -2;
+  const isWasted = whz < -2;
+  const m = Math.floor(age);
+  const sex = gender === 'P' ? ', Perempuan' : gender === 'L' ? ', Laki-laki' : '';
+  const fileStatus = (s: string) => (s ? `, status di berkas: ${s}` : '');
+  // Median WHO tidak ditampilkan: tabel LMS WHO 2006 tidak tersedia secara andal di aplikasi ini
+  const status = `Tinggi ${height} cm (Z-Score TB/U ${haz.toFixed(2)} SD${fileStatus(st.tbu)}). ` +
+    `Berat ${weight} kg (Z-Score BB/U ${waz.toFixed(2)} SD${fileStatus(st.bbu)}). ` +
+    `Z-Score BB/TB ${whz.toFixed(2)} SD${fileStatus(st.bbtb)}.`;
+
+  let ageMenuPlan: string;
+  if (m < 6) {
+    ageMenuPlan = 'Fase Usia < 6 Bulan: ASI eksklusif on-demand minimal 8-12 kali per 24 jam tanpa tambahan air putih atau makanan padat. Ibu menyusui dianjurkan mengonsumsi protein hewani harian dan tablet tambah darah agar kualitas gizi ASI optimal.';
+  } else if (m <= 8) {
+    ageMenuPlan = 'Fase MPASI Awal (6-8 Bulan): Tekstur saring/lumat kental. 2-3 kali makan utama (mulai 2-3 sdm bertahap hingga 1/2 mangkuk 125 ml) + 1-2 selingan. Sertakan protein hewani setiap hari (telur, hati ayam, atau ikan) dan sedikit lemak tambahan sebagai sumber energi.';
+  } else if (m <= 11) {
+    ageMenuPlan = 'Fase MPASI Lanjutan (9-11 Bulan): Tekstur cincang halus atau finger food lunak. 3-4 kali makan utama (1/2 mangkuk 125-150 ml) + 1-2 selingan dan ASI. Sertakan telur dan ikan/daging setiap hari.';
+  } else if (m <= 23) {
+    ageMenuPlan = 'Fase Makanan Keluarga (12-23 Bulan): Makanan keluarga dipotong kecil/lunak, 3-4 kali makan utama (3/4 mangkuk 200 ml) + 2 selingan padat protein + ASI hingga 2 tahun.';
+  } else if (m <= 35) {
+    ageMenuPlan = 'Fase Batita (2-3 Tahun): Menu Isi Piringku 3 kali sehari + 2 selingan buah atau kudapan protein hewani. Batasi jajanan manis kemasan dan minuman berpemanis.';
+  } else {
+    ageMenuPlan = 'Fase Prasekolah (3-5 Tahun): Menu gizi seimbang Isi Piringku 3 kali makan utama + 2 selingan sehat, protein hewani setiap hari, sayur dan buah beragam, air minum matang.';
   }
 
-  const headerRow = rows[bestHeaderRowIdx] || [];
-  let dataStartIdx = bestHeaderRowIdx + 1;
-  const nextRow = rows[bestHeaderRowIdx + 1];
-  let subheaderUsed = false;
-  let finalHeaders: string[] = [];
-
-  // Check if row below is a genuine merged subheader row (NOT child data)
-  // Data rows have a numeric index in col 0 (e.g. 1, 2) or names in col 1, whereas subheaders have units/labels.
-  const isNextRowData = nextRow && Array.isArray(nextRow) && (
-    typeof nextRow[0] === 'number' ||
-    String(nextRow[0]).trim() === '1' ||
-    (nextRow[1] && typeof nextRow[1] === 'string' && nextRow[1].trim().length > 3 && isNaN(Number(nextRow[1])))
-  );
-
-  if (!isNextRowData && nextRow && Array.isArray(nextRow) && dataStartIdx < rows.length) {
-    let subheaderKeywords = ['cm', 'kg', 'sd', 'l', 'p', 'zscore', 'status', 'kategori'];
-    let subScore = 0;
-    for (const cell of nextRow) {
-      const cellNorm = normalizeColName(String(cell));
-      if (cellNorm && subheaderKeywords.includes(cellNorm)) subScore++;
-    }
-    if (subScore >= 2) {
-      dataStartIdx = bestHeaderRowIdx + 2;
-      subheaderUsed = true;
-      const maxCols = Math.max(headerRow.length, nextRow.length);
-      for (let c = 0; c < maxCols; c++) {
-        const top = String(headerRow[c] || '').trim();
-        const btm = String(nextRow[c] || '').trim();
-        let combined = '';
-        if (top && btm && top !== btm) {
-          combined = `${top} ${btm}`;
-        } else {
-          combined = btm || top || `Kolom_${c + 1}`;
-        }
-        finalHeaders.push(combined);
-      }
-    }
+  let targetedDiet: string;
+  if (isSevere) {
+    targetedDiet = 'Kategori berat: perbanyak protein hewani harian dan densitas energi makanan; konsultasikan ke tenaga kesehatan/Puskesmas untuk tata laksana gizi sesuai pedoman.';
+  } else if (isModerate) {
+    targetedDiet = 'Kategori sedang: Pemberian Makanan Tambahan (PMT) berbahan pangan lokal sesuai program Puskesmas, dengan sumber protein hewani dan zat besi setiap hari.';
+  } else if (isWasted || isUnderweight) {
+    targetedDiet = 'Berat badan kurang: utamakan kenaikan berat badan dengan menambah densitas kalori makanan dan selingan tinggi protein.';
+  } else if (isOverweight) {
+    targetedDiet = 'Risiko gizi lebih: pertahankan protein hewani, ganti camilan manis dengan buah segar dan sayur, dorong aktivitas fisik bermain minimal 60 menit sehari.';
+  } else {
+    targetedDiet = 'Pemeliharaan gizi: pertahankan protein hewani harian, sayur beragam, dan air minum matang agar pertumbuhan tetap di jalur normal.';
   }
 
-  if (!subheaderUsed) {
-    finalHeaders = headerRow.map((cell: any, c: number) => {
-      const s = String(cell || '').trim();
-      return s || `Kolom_${c + 1}`;
-    });
-  }
+  const actions: string[] = [];
+  const nl = notes.toLowerCase();
+  if (/diare|mencret|\bcair\b/.test(nl)) actions.push('Riwayat diare pada catatan: tata laksana diare dengan oralit dan zinc sesuai anjuran tenaga kesehatan.');
+  if (/batuk|\btb\b|tuberkulosis|flek|paru/.test(nl)) actions.push('Keluhan batuk/riwayat TB pada catatan: rujuk ke Puskesmas untuk skrining TB anak.');
+  if (isSevere) actions.push('Rujuk ke Puskesmas/dokter anak untuk evaluasi penyebab gagal tumbuh dan pemeriksaan anemia.');
+  else if (isModerate || isUnderweight || isWasted) actions.push('Konseling gizi di Puskesmas: evaluasi praktik Pemberian Makan Bayi dan Anak (PMBA) dan kepatuhan PMT.');
+  if (m >= 12) actions.push('Obat cacing sesuai jadwal program (setiap 6 bulan) di Posyandu.');
+  actions.push('Sanitasi & CTPS: cuci tangan pakai sabun pada waktu kritis dan pastikan air minum dimasak hingga mendidih.');
 
-  // Deduplicate column names if needed
-  const seenHeaderCounts: Record<string, number> = {};
-  finalHeaders = finalHeaders.map(h => {
-    if (!seenHeaderCounts[h]) {
-      seenHeaderCounts[h] = 1;
-      return h;
-    } else {
-      seenHeaderCounts[h]++;
-      return `${h}_${seenHeaderCounts[h]}`;
-    }
+  const schedule = isSevere
+    ? 'Pemantauan ketat sesuai arahan Puskesmas/faskes rujukan.'
+    : isModerate || isUnderweight || isWasted
+      ? 'Pemantauan berkala BB dan PB/TB di Posyandu atau Pos Gizi Puskesmas.'
+      : 'Pemantauan rutin bulanan BB dan PB/TB pada hari buka Posyandu.';
+
+  return {
+    Prioritas_Intervensi: PRIORITY[key],
+    Saran_Asupan_Nutrisi: `[Balita ${m} bln${sex}]: ${status} ${ageMenuPlan} ${targetedDiet}`,
+    Tindakan_Medis_Sanitasi: actions.join(' '),
+    Jadwal_Monitoring: schedule,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Ringkasan per lembar (dipakai kedua mode)
+// ---------------------------------------------------------------------------
+function summarizeSheet(base: Omit<SheetResult, 'clusterProfiles' | 'labelDistribution' | 'crosstab' | 'purityScore'>,
+  labelField: string, semantic: { cluster_id: number; cluster_label: string; confidence: number | null }[] | null): SheetResult {
+  const { records } = base;
+  const byCluster = new Map<number, ChildRecord[]>();
+  for (const r of records) {
+    const cid = Number(r.CURE_Cluster_ID);
+    if (cid >= 0) byCluster.set(cid, [...(byCluster.get(cid) ?? []), r]);
+  }
+  const clustered = [...byCluster.values()].reduce((a, m) => a + m.length, 0);
+  const clusterProfiles: ClusterProfile[] = [...byCluster.entries()].sort((a, b) => a[0] - b[0]).map(([cid, members]) => {
+    const counts: Record<string, number> = {};
+    for (const r of members) counts[r[RULE_LABEL_FIELD]] = (counts[r[RULE_LABEL_FIELD]] ?? 0) + 1;
+    const [majority, majorityCount] = Object.entries(counts).sort((a, b) => b[1] - a[1])[0];
+    const nums = (role: Role) => members.map(r => roleValue(r, role)).filter((v): v is number => v !== null);
+    const hazMean = mean(nums('haz'));
+    const share = round((majorityCount / members.length) * 100, 1);
+    const sem = semantic?.find(s => s.cluster_id === cid);
+    return {
+      clusterId: cid,
+      name: `Klaster ${cid}: mayoritas ${shortLabel(majority)} (${share}%)${hazMean !== null ? `, rerata HAZ ${hazMean.toFixed(2)}` : ''}`,
+      count: members.length,
+      percentage: round((members.length / records.length) * 100, 1),
+      hazMean: hazMean === null ? null : round(hazMean, 2),
+      wazMean: round(mean(nums('waz')) ?? NaN, 2),
+      whzMean: round(mean(nums('whz')) ?? NaN, 2),
+      ageMean: round(mean(members.map(r => Number(r.Usia_Bulan_Dihitung)).filter(Number.isFinite)) ?? NaN, 1),
+      majorityCategory: majority,
+      majorityShare: share,
+      semanticLabel: sem?.cluster_label ?? null,
+      semanticConfidence: sem?.confidence ?? null,
+    };
   });
 
-  // Build raw data objects
-  const rawData: Record<string, any>[] = [];
-  for (let r = dataStartIdx; r < rows.length; r++) {
-    const row = rows[r];
-    if (!Array.isArray(row)) continue;
-    const hasData = row.some(val => val !== null && val !== undefined && String(val).trim() !== '');
-    if (!hasData) continue;
-
-    const obj: Record<string, any> = {};
-    for (let c = 0; c < finalHeaders.length; c++) {
-      const colName = finalHeaders[c];
-      obj[colName] = row[c] !== undefined ? row[c] : '';
-    }
-    rawData.push(obj);
+  const nameOf = new Map(clusterProfiles.map(p => [p.clusterId, p.name]));
+  const crosstab: Record<string, Record<string, number>> = {};
+  const labelDistribution: Record<string, number> = {};
+  let maxSum = 0;
+  for (const r of records) {
+    const lbl = String(r[labelField]);
+    labelDistribution[lbl] = (labelDistribution[lbl] ?? 0) + 1;
+    const cid = Number(r.CURE_Cluster_ID);
+    r.Profil_Klaster = nameOf.get(cid) ?? 'Tidak terklaster';
+    if (cid < 0) continue;
+    const cKey = r.Profil_Klaster;
+    const kKey = shortLabel(r[RULE_LABEL_FIELD]);
+    crosstab[cKey] ??= {};
+    crosstab[cKey][kKey] = (crosstab[cKey][kKey] ?? 0) + 1;
   }
-
-  return { rawData, detectedHeaders: finalHeaders };
-}
-
-// Extract standard anthropometrics and demographics from any record
-export function extractChildIndicators(record: Record<string, any>, sheetName: string = ''): {
-  childName: string;
-  haz: number | null;
-  waz: number | null;
-  whz: number | null;
-  ageMonths: number | null;
-  heightCm: number | null;
-  weightKg: number | null;
-  gender: 'L' | 'P' | null;
-  statusText: string;
-  notes: string;
-  tbUStatus: string;
-  bbUStatus: string;
-  bbTbStatus: string;
-} {
-  let childName = '';
-  let haz: number | null = null;
-  let waz: number | null = null;
-  let whz: number | null = null;
-  let ageMonths: number | null = null;
-  let heightCm: number | null = null;
-  let weightKg: number | null = null;
-  let gender: 'L' | 'P' | null = null;
-  let notes = '';
-  let statusText = '';
-  let tbUStatus = '';
-  let bbUStatus = '';
-  let bbTbStatus = '';
-
-  let birthDate: Date | null = null;
-  let visitDate: Date | null = null;
-
-  // Infer survey year from sheet name (e.g. '2024' or '2025')
-  let surveyYear = 2024;
-  const yearMatch = sheetName.match(/\b(202[0-9])\b/);
-  if (yearMatch) {
-    surveyYear = parseInt(yearMatch[1]);
-  } else {
-    const currentYear = new Date().getFullYear();
-    surveyYear = currentYear <= 2026 ? currentYear : 2024;
-  }
-  // August 1st is the standard annual Indonesian Posyandu Bulan Timbang
-  const defaultSurveyDate = new Date(surveyYear, 7, 1);
-
-  for (const [rawKey, rawVal] of Object.entries(record)) {
-    if (rawVal === null || rawVal === undefined) continue;
-    const key = normalizeColName(rawKey);
-    const valStr = String(rawVal).trim().toLowerCase();
-
-    // Child Name: Match 'nama', 'nama_anak', 'nama_balita', 'balita'
-    if (!childName && (key === 'nama' || key.startsWith('nama_') || key === 'balita' || key === 'anak' || key === 'bayi')) {
-      if (!key.includes('ortu') && !key.includes('ibu') && !key.includes('ayah') && !key.includes('posyandu') && !key.includes('puskesmas') && !key.includes('desa')) {
-        if (typeof rawVal === 'string' && rawVal.trim().length > 1 && isNaN(Number(rawVal))) {
-          childName = rawVal.trim();
-        }
-      }
-    }
-
-    // Gender detection: Match 'jk', 'gender', 'jenis_kelamin', 'sex'
-    if (['jk', 'gender', 'jenis_kelamin', 'sex', 'l_p', 'j_k'].includes(key) || key.startsWith('jk_')) {
-      if (valStr.startsWith('l') || valStr.includes('laki') || valStr.includes('pria') || valStr === '1' || valStr === 'male') {
-        gender = 'L';
-      } else if (valStr.startsWith('p') || valStr.includes('perempuan') || valStr.includes('wanita') || valStr === '2' || valStr === 'female') {
-        gender = 'P';
-      }
-    }
-
-    // Date of Birth: Handle Excel serial dates (e.g. 44119) and standard strings
-    if (key.includes('lahir') || key.includes('birth') || key === 'tgl_lhr') {
-      if (typeof rawVal === 'number' && rawVal > 25000 && rawVal < 65000) {
-        birthDate = new Date(Math.round((rawVal - 25569) * 86400 * 1000));
-      } else if (typeof rawVal === 'string' && rawVal.trim().length > 0) {
-        const numVal = parseNumericValue(rawVal);
-        if (numVal !== null && numVal > 25000 && numVal < 65000) {
-          birthDate = new Date(Math.round((numVal - 25569) * 86400 * 1000));
-        } else {
-          const d = new Date(rawVal);
-          if (!isNaN(d.getTime())) birthDate = d;
-        }
-      }
-    }
-
-    // Measurement Date
-    if (key.includes('tgl_ukur') || key.includes('tgl_timbang') || key.includes('tgl_kunjungan')) {
-      if (typeof rawVal === 'number' && rawVal > 25000 && rawVal < 65000) {
-        visitDate = new Date(Math.round((rawVal - 25569) * 86400 * 1000));
-      } else {
-        const d = new Date(rawVal);
-        if (!isNaN(d.getTime())) visitDate = d;
-      }
-    }
-
-    // Explicit Age in Months column (if present in Excel)
-    if (
-      ['usia_bulan', 'umur_bulan', 'usia', 'umur', 'bulan', 'age', 'age_months', 'umur_bln', 'usia_bln', 'u_bln', 'u_bulan'].includes(key) ||
-      ((key.includes('usia') || key.includes('umur')) && !key.includes('tgl') && !key.includes('tanggal'))
-    ) {
-      const thMatch = valStr.match(/(\d+)\s*(th|tahun|yr|year)/);
-      const blnMatch = valStr.match(/(\d+)\s*(bln|bulan|mo|month)/);
-      if (thMatch || blnMatch) {
-        const years = thMatch ? parseInt(thMatch[1]) : 0;
-        const months = blnMatch ? parseInt(blnMatch[1]) : 0;
-        ageMonths = years * 12 + months;
-      } else {
-        const num = parseNumericValue(rawVal);
-        if (num !== null && num >= 0 && num <= 72) {
-          ageMonths = Math.round(num);
-        }
-      }
-    }
-
-    // Height in cm (TB / PB) - Exclude TB/U and Z-score columns
-    const isHeightCol = (key === 'tinggi' || key === 'tb' || key === 'pb' || key === 'panjang' || key.includes('tinggi_badan') || key.includes('panjang_badan')) &&
-      !key.includes('tb_u') && !key.includes('zs') && !key.includes('zscore') && !key.includes('status') && !key.includes('kategori');
-
-    if (isHeightCol) {
-      const num = parseNumericValue(rawVal);
-      if (num !== null && num >= 30 && num <= 150) {
-        heightCm = num;
-      }
-    }
-
-    // Weight in kg (BB) - Exclude BB/U, BB/TB and Z-score columns
-    const isWeightCol = (key === 'berat' || key === 'bb' || key.includes('berat_badan')) &&
-      !key.includes('bb_u') && !key.includes('bb_tb') && !key.includes('bbtb') && !key.includes('zs') && !key.includes('zscore') && !key.includes('status') && !key.includes('kategori');
-
-    if (isWeightCol) {
-      const num = parseNumericValue(rawVal);
-      if (num !== null && num >= 1.0 && num <= 50) {
-        weightKg = num;
-      }
-    }
-
-    // HAZ: Z-Score TB/U (Height-for-Age)
-    // Matches 'zs_tb_u', 'zscore_tb_u', 'haz', 'tb_u_zscore' (strictly excludes bb_tb and whz)
-    const isHazCol = (key.includes('tb') || key.includes('haz')) &&
-      (key.includes('zs') || key.includes('zscore') || key.includes('z_score')) &&
-      !key.includes('bb_tb') && !key.includes('bbtb') && !key.includes('whz');
-
-    if (isHazCol || key === 'haz' || key === 'zscore_tb_u' || key === 'zs_tb_u') {
-      const num = parseNumericValue(rawVal);
-      if (num !== null) {
-        // Clamp extreme outliers to WHO physiological bounds [-5.0, 5.0]
-        haz = Math.max(-5.0, Math.min(5.0, num));
-      }
-    } else if (key === 'tb_u' || key === 'tbu' || key === 'status_tb_u') {
-      tbUStatus = String(rawVal).trim();
-      statusText += ` ${valStr}`;
-    }
-
-    // WAZ: Z-Score BB/U (Weight-for-Age)
-    // Matches 'zs_bb_u', 'zscore_bb_u', 'waz' (strictly excludes tb)
-    const isWazCol = (key.includes('bb') || key.includes('waz')) &&
-      (key.includes('zs') || key.includes('zscore') || key.includes('z_score')) &&
-      !key.includes('tb');
-
-    if (isWazCol || key === 'waz' || key === 'zscore_bb_u' || key === 'zs_bb_u') {
-      const num = parseNumericValue(rawVal);
-      if (num !== null) {
-        waz = Math.max(-5.0, Math.min(5.0, num));
-      }
-    } else if (key === 'bb_u' || key === 'bbu' || key === 'status_bb_u') {
-      bbUStatus = String(rawVal).trim();
-      statusText += ` ${valStr}`;
-    }
-
-    // WHZ: Z-Score BB/TB (Weight-for-Height)
-    // Matches 'zs_bb_tb', 'zscore_bb_tb', 'whz'
-    const isWhzCol = (key.includes('bb_tb') || key.includes('bbtb') || key.includes('whz')) &&
-      (key.includes('zs') || key.includes('zscore') || key.includes('z_score') || key === 'whz');
-
-    if (isWhzCol || key === 'whz' || key === 'zscore_bb_tb' || key === 'zs_bb_tb') {
-      const num = parseNumericValue(rawVal);
-      if (num !== null) {
-        whz = Math.max(-5.0, Math.min(5.0, num));
-      }
-    } else if (key === 'bb_tb' || key === 'bbtb' || key === 'status_bb_tb') {
-      bbTbStatus = String(rawVal).trim();
-      statusText += ` ${valStr}`;
-    }
-
-    // General qualitative or clinical notes
-    if (['catatan', 'keterangan', 'keluhan', 'riwayat', 'diagnosa', 'hasil', 'notes'].some(t => key.includes(t))) {
-      notes += ` ${rawVal}`;
-    }
-  }
-
-  // Calculate ageMonths from birthDate if not explicitly given
-  if (ageMonths === null && birthDate) {
-    const refDate = visitDate || defaultSurveyDate;
-    const diffMs = refDate.getTime() - birthDate.getTime();
-    if (diffMs >= 0) {
-      ageMonths = Math.min(72, Math.max(0, Math.round(diffMs / (1000 * 60 * 60 * 24 * 30.4375))));
-    }
-  }
-
-  // Fallback: If qualitative TB/U is given but numeric HAZ is missing, assign standard representative Z-score
-  if (haz === null && tbUStatus) {
-    const sLower = tbUStatus.toLowerCase();
-    if (sLower.includes('sangat pendek')) haz = -3.4;
-    else if (sLower.includes('pendek')) haz = -2.4;
-    else if (sLower.includes('normal')) haz = 0.1;
-    else if (sLower.includes('tinggi')) haz = 2.2;
-  }
-
-  // Fallback: If qualitative BB/U is given but numeric WAZ is missing
-  if (waz === null && bbUStatus) {
-    const sLower = bbUStatus.toLowerCase();
-    if (sLower.includes('sangat kurang')) waz = -3.2;
-    else if (sLower.includes('kurang')) waz = -2.2;
-    else if (sLower.includes('normal')) waz = 0.0;
-  }
-
-  // Fallback: If qualitative BB/TB is given but numeric WHZ is missing
-  if (whz === null && bbTbStatus) {
-    const sLower = bbTbStatus.toLowerCase();
-    if (sLower.includes('gizi buruk')) whz = -3.3;
-    else if (sLower.includes('gizi kurang')) whz = -2.2;
-    else if (sLower.includes('gizi baik') || sLower.includes('normal')) whz = 0.1;
-    else if (sLower.includes('gizi lebih') || sLower.includes('obesitas')) whz = 2.2;
-  }
-
-  // Note: Unsupported polynomial approximations for HAZ and WAZ have been removed
-  // in accordance with research methodology. Missing Z-scores remain null.
-
+  for (const row of Object.values(crosstab)) maxSum += Math.max(...Object.values(row));
+  const columns = base.columns.includes('Profil_Klaster') ? base.columns : [...base.columns, 'Profil_Klaster'];
   return {
-    childName,
-    haz,
-    waz,
-    whz,
-    ageMonths,
-    heightCm,
-    weightKg,
-    gender,
-    statusText,
-    notes: `${notes} ${statusText}`.trim(),
-    tbUStatus,
-    bbUStatus,
-    bbTbStatus
+    ...base, columns, clusterProfiles, labelDistribution, crosstab,
+    purityScore: clustered ? round((maxSum / clustered) * 100, 2) : null,
   };
 }
 
-/**
- * Production CURE (Clustering Using Representatives) Algorithm
- * 
- * - Represents each cluster by c well-scattered points shrunk towards the cluster centroid by alpha.
- * - Outlier-resistant: Bound features to WHO biological limits to prevent cluster collapse.
- * - Partitioned into 4 clinical phenotypes:
- *   0: Stunting & Malnutrisi Kronis (Prioritas Kritis)
- *   1: Risiko Gagal Tumbuh / Underweight (Prioritas Sedang)
- *   2: Pertumbuhan Normal & Gizi Optimal (Prioritas Pemeliharaan)
- *   3: Pertumbuhan Tinggi / Risiko Gizi Lebih (Prioritas Seimbang)
- */
-export class CUREAlgorithm {
-  private k: number;
-  private c: number;
-  private alpha: number;
-
-  constructor(k: number = 4, c: number = 5, alpha: number = 0.3) {
-    this.k = Math.max(2, k);
-    this.c = Math.max(1, c);
-    this.alpha = Math.max(0.05, Math.min(0.95, alpha));
-  }
-
-  public fitPredict(features: number[][]): { labels: number[]; representatives: number[][][] } {
-    const N = features.length;
-    const D = features[0]?.length || 4;
-    if (N === 0) return { labels: [], representatives: [] };
-    if (N <= this.k) {
-      return {
-        labels: Array.from({ length: N }, (_, i) => i % this.k),
-        representatives: []
-      };
-    }
-
-    // Standardize features
-    const means = new Float64Array(D);
-    const stds = new Float64Array(D);
-    for (let i = 0; i < N; i++) {
-      for (let j = 0; j < D; j++) means[j] += features[i][j];
-    }
-    for (let j = 0; j < D; j++) means[j] /= N;
-
-    for (let i = 0; i < N; i++) {
-      for (let j = 0; j < D; j++) {
-        const d = features[i][j] - means[j];
-        stds[j] += d * d;
-      }
-    }
-    for (let j = 0; j < D; j++) {
-      stds[j] = Math.sqrt(stds[j] / N) || 1.0;
-    }
-
-    const scaled = new Float64Array(N * D);
-    for (let i = 0; i < N; i++) {
-      for (let j = 0; j < D; j++) {
-        scaled[i * D + j] = (features[i][j] - means[j]) / stds[j];
-      }
-    }
-
-    // Clinical anchor seeds in anthropometric feature space [HAZ, WAZ, WHZ, normalizedAge]
-    // Exactly matches the 7 Expert Clinical Categories of Kemenkes RI (Permenkes 2/2020) & WHO 2006:
-    const clinicalSeeds7: number[][] = [
-      [-3.4, -2.8, -2.4, 0.40], // Seed 0: Stunting Berat + Komorbiditas Klinis (HAZ < -3, WAZ < -2, WHZ < -2)
-      [-3.1, -1.5, -0.2, 0.45], // Seed 1: Stunting Kronis / Sangat Pendek (HAZ < -3, WHZ normal/sedang)
-      [-2.3, -1.4, -0.4, 0.45], // Seed 2: Stunting Sedang / Pendek (HAZ -2 s/d -3)
-      [-0.5, -3.1, -3.2, 0.35], // Seed 3: Gizi Buruk Akut / Wasting Berat (WHZ < -3, WAZ < -3)
-      [-1.2, -2.2, -2.1, 0.40], // Seed 4: Gizi Kurang / Risiko Gagal Tumbuh (WAZ < -2, WHZ < -2)
-      [ 0.1,  0.2,  0.2, 0.50], // Seed 5: Pertumbuhan Normal / Gizi Optimal (Semua Z-Score rentang normal)
-      [ 1.4,  1.8,  2.1, 0.55]  // Seed 6: Risiko Gizi Lebih / Overweight (WHZ > 2 atau HAZ tinggi)
-    ];
-
-    const clinicalSeeds4: number[][] = [
-      [-3.2, -2.5, -2.0, 0.40], // Seed 0: Stunting Berat / Malnutrisi Kronis
-      [-2.1, -1.6, -1.0, 0.42], // Seed 1: Stunting Sedang / Risiko Underweight
-      [ 0.0,  0.1,  0.1, 0.48], // Seed 2: Pertumbuhan Normal Optimal
-      [ 1.4,  1.5,  1.6, 0.52]  // Seed 3: Pertumbuhan Tinggi / Risiko Lebih
-    ];
-
-    // Build exactly this.k seeds guaranteed to be populated
-    const chosenSeeds: number[][] = [];
-    if (this.k === 7) {
-      for (let i = 0; i < 7; i++) chosenSeeds.push([...clinicalSeeds7[i]]);
-    } else if (this.k === 4) {
-      for (let i = 0; i < 4; i++) chosenSeeds.push([...clinicalSeeds4[i]]);
-    } else if (this.k < 7) {
-      const step = (clinicalSeeds7.length - 1) / Math.max(1, this.k - 1);
-      for (let i = 0; i < this.k; i++) {
-        const idx = Math.min(clinicalSeeds7.length - 1, Math.round(i * step));
-        chosenSeeds.push([...clinicalSeeds7[idx]]);
-      }
-    } else {
-      for (const s of clinicalSeeds7) chosenSeeds.push([...s]);
-      while (chosenSeeds.length < this.k) {
-        const sampleIdx = Math.floor((chosenSeeds.length / this.k) * N);
-        chosenSeeds.push(Array.from(features[sampleIdx] || features[0]));
-      }
-    }
-
-    const scaledSeeds: number[][] = chosenSeeds.map(row =>
-      row.map((val, j) => (val - (j < D ? means[j] : 0)) / (j < D ? stds[j] : 1.0))
-    );
-
-    // Initial assignment
-    const clusterLabels = new Int32Array(N);
-    const clusterCounts = new Int32Array(this.k);
-    const clusterSums = Array.from({ length: this.k }, () => new Float64Array(D));
-
-    for (let i = 0; i < N; i++) {
-      let minDist = Infinity;
-      let bestC = 0;
-      for (let c = 0; c < this.k; c++) {
-        let dist = 0;
-        for (let j = 0; j < D; j++) {
-          const diff = scaled[i * D + j] - scaledSeeds[c][j];
-          dist += diff * diff;
-        }
-        if (dist < minDist) {
-          minDist = dist;
-          bestC = c;
-        }
-      }
-      clusterLabels[i] = bestC;
-      clusterCounts[bestC]++;
-      for (let j = 0; j < D; j++) {
-        clusterSums[bestC][j] += scaled[i * D + j];
-      }
-    }
-
-    // Centroid refinement (2 iterations)
-    for (let iter = 0; iter < 2; iter++) {
-      for (let c = 0; c < this.k; c++) {
-        if (clusterCounts[c] > 0) {
-          for (let j = 0; j < D; j++) {
-            scaledSeeds[c][j] = clusterSums[c][j] / clusterCounts[c];
-          }
-        }
-      }
-      clusterCounts.fill(0);
-      for (let c = 0; c < this.k; c++) clusterSums[c].fill(0);
-
-      for (let i = 0; i < N; i++) {
-        let minDist = Infinity;
-        let bestC = 0;
-        for (let c = 0; c < this.k; c++) {
-          let dist = 0;
-          for (let j = 0; j < D; j++) {
-            const diff = scaled[i * D + j] - scaledSeeds[c][j];
-            dist += diff * diff;
-          }
-          if (dist < minDist) {
-            minDist = dist;
-            bestC = c;
-          }
-        }
-        clusterLabels[i] = bestC;
-        clusterCounts[bestC]++;
-        for (let j = 0; j < D; j++) {
-          clusterSums[bestC][j] += scaled[i * D + j];
-        }
-      }
-    }
-
-    // Select c well-scattered representative points and shrink them towards centroid by alpha
-    const clusterReps: number[][][] = [];
-    for (let c = 0; c < this.k; c++) {
-      const cent = scaledSeeds[c];
-      const members: number[] = [];
-      for (let i = 0; i < N; i++) {
-        if (clusterLabels[i] === c) members.push(i);
-      }
-
-      if (members.length === 0) {
-        clusterReps.push([Array.from(cent)]);
-        continue;
-      }
-
-      const selected: number[] = [];
-      const sampleSize = Math.min(members.length, 300);
-
-      // 1st rep: farthest from centroid
-      let maxDist = -1;
-      let firstIdx = members[0];
-      for (let s = 0; s < sampleSize; s++) {
-        const idx = members[Math.floor(s * members.length / sampleSize)];
-        let d = 0;
-        for (let j = 0; j < D; j++) {
-          const diff = scaled[idx * D + j] - cent[j];
-          d += diff * diff;
-        }
-        if (d > maxDist) {
-          maxDist = d;
-          firstIdx = idx;
-        }
-      }
-      selected.push(firstIdx);
-
-      // Remaining reps: max-min distance from currently selected reps
-      while (selected.length < this.c && selected.length < members.length) {
-        let bestDist = -1;
-        let nextIdx = members[0];
-        for (let s = 0; s < sampleSize; s++) {
-          const idx = members[Math.floor(s * members.length / sampleSize)];
-          if (selected.includes(idx)) continue;
-          let minDistToRep = Infinity;
-          for (const sel of selected) {
-            let d = 0;
-            for (let j = 0; j < D; j++) {
-              const diff = scaled[idx * D + j] - scaled[sel * D + j];
-              d += diff * diff;
-            }
-            if (d < minDistToRep) minDistToRep = d;
-          }
-          if (minDistToRep > bestDist) {
-            bestDist = minDistToRep;
-            nextIdx = idx;
-          }
-        }
-        selected.push(nextIdx);
-      }
-
-      // Shrink representative points towards centroid
-      const shrunk = selected.map(sel => {
-        const pt: number[] = [];
-        for (let j = 0; j < D; j++) {
-          const v = scaled[sel * D + j];
-          pt.push(v + this.alpha * (cent[j] - v));
-        }
-        return pt;
-      });
-      clusterReps.push(shrunk);
-    }
-
-    // Final CURE assignment: assign each point to cluster with closest shrunk representative
-    const finalLabels = new Array(N).fill(0);
-    for (let i = 0; i < N; i++) {
-      let minDist = Infinity;
-      let bestC = 0;
-      for (let c = 0; c < this.k; c++) {
-        const reps = clusterReps[c];
-        for (const rep of reps) {
-          let dist = 0;
-          for (let j = 0; j < D; j++) {
-            const diff = scaled[i * D + j] - rep[j];
-            dist += diff * diff;
-          }
-          if (dist < minDist) {
-            minDist = dist;
-            bestC = c;
-          }
-        }
-      }
-      finalLabels[i] = bestC;
-    }
-
-    return { labels: finalLabels, representatives: clusterReps };
-  }
+// ---------------------------------------------------------------------------
+// Mode tanpa server
+// ---------------------------------------------------------------------------
+const XLSX_MAGIC = [0x50, 0x4b, 0x03, 0x04];
+const XLS_MAGIC = [0xd0, 0xcf, 0x11, 0xe0, 0xa1, 0xb1, 0x1a, 0xe1];
+export function hasExcelSignature(head: Uint8Array): boolean {
+  const starts = (sig: number[]) => sig.every((b, i) => head[i] === b);
+  return starts(XLSX_MAGIC) || starts(XLS_MAGIC);
 }
 
-// Predict status and generate personalized, child-specific recommendations
-export function predictChildClassification(indicators: ReturnType<typeof extractChildIndicators>): {
-  autoLabel: string;
-  confidence: number;
-  priority: string;
-  saranNutrisi: string;
-  tindakanMedis: string;
-  jadwalMonitoring: string;
-} {
-  const { childName, haz, waz, whz, ageMonths, heightCm, weightKg, gender, notes, tbUStatus, bbUStatus, bbTbStatus } = indicators;
-
-  const notesLower = notes.toLowerCase();
-  const tbULower = tbUStatus.toLowerCase();
-  const bbULower = bbUStatus.toLowerCase();
-  const bbTbLower = bbTbStatus.toLowerCase();
-
-  const isExplicitSeverelyStunted = tbULower.includes('sangat pendek') || (haz !== null && haz < -3.0);
-  const isExplicitStunted = !isExplicitSeverelyStunted && (tbULower.includes('pendek') || (haz !== null && haz >= -3.0 && haz < -2.0));
-  const isExplicitSevereWasted = bbTbLower.includes('gizi buruk') || (whz !== null && whz < -3.0);
-  const isExplicitWasted = !isExplicitSevereWasted && (bbTbLower.includes('gizi kurang') || (whz !== null && whz >= -3.0 && whz < -2.0));
-  const isExplicitUnderweight = bbULower.includes('sangat kurang') || bbULower.includes('kurang') || (waz !== null && waz < -2.0);
-  const isExplicitOverweight = bbTbLower.includes('lebih') || bbTbLower.includes('obesitas') || (whz !== null && whz > 2.0);
-
-  let label = TAXONOMY.NORMAL_OPTIMAL;
-  let confidence = 0.90;
-  let priority = 'Rendah (Pemantauan Rutin Posyandu)';
-
-  // Clinical Decision Tree based on Permenkes RI No. 2/2020 & WHO 2006 Standards
-  if (isExplicitSeverelyStunted) {
-    if (isExplicitSevereWasted || isExplicitUnderweight || notesLower.includes('komorbid') || notesLower.includes('tb')) {
-      label = TAXONOMY.STUNTING_BERAT_KOMORBID;
-      confidence = 0.96;
-      priority = 'Kritis (Intervensi Medis & Rujukan RS)';
-    } else {
-      label = TAXONOMY.STUNTING_KRONIS;
-      confidence = 0.94;
-      priority = 'Tinggi (Intervensi Gizi Spesifik)';
+function detectHeaderRow(rows: unknown[][]): number {
+  let best = 0, bestScore = -1;
+  for (let r = 0; r < Math.min(15, rows.length); r++) {
+    let score = 0;
+    for (const cell of rows[r] ?? []) {
+      if (cell === null || cell === undefined || cell === '') continue;
+      if (normalizeColName(cell).split('_').some(t => HEADER_KEYWORDS.has(t))) score++;
     }
-  } else if (isExplicitStunted) {
-    if (isExplicitUnderweight || isExplicitWasted) {
-      label = TAXONOMY.STUNTING_BERAT_KOMORBID;
-      confidence = 0.90;
-      priority = 'Tinggi (Intervensi Gizi Spesifik)';
-    } else {
-      label = TAXONOMY.STUNTING_SEDANG;
-      confidence = 0.92;
-      priority = 'Sedang (Pemberian Makanan Tambahan PMT)';
-    }
-  } else if (isExplicitSevereWasted) {
-    label = TAXONOMY.GIZI_BURUK_AKUT;
-    confidence = 0.95;
-    priority = 'Kritis (Tatalaksana Gizi Buruk / TFC)';
-  } else if (isExplicitWasted || isExplicitUnderweight) {
-    label = TAXONOMY.GIZI_KURANG_RISIKO;
-    confidence = 0.89;
-    priority = 'Sedang (Pemantauan Kejar Tumbuh)';
-  } else if (isExplicitOverweight) {
-    label = TAXONOMY.RISIKO_GIZI_LEBIH;
-    confidence = 0.88;
-    priority = 'Rendah (Pola Makan Seimbang)';
-  } else {
-    label = TAXONOMY.NORMAL_OPTIMAL;
-    confidence = 0.95;
-    priority = 'Rendah (Pemantauan Rutin Posyandu)';
+    if (score > bestScore) { bestScore = score; best = r; }
   }
+  return best;
+}
 
-  // Generate deeply tailored, individual recommendations
-  const recommendations = generateInterventionRecommendations(
-    label,
-    ageMonths,
-    haz,
-    waz,
-    whz,
-    heightCm,
-    weightKg,
-    childName,
-    gender,
-    notes,
-    tbUStatus,
-    bbUStatus,
-    bbTbStatus
-  );
+export function analyzeWorkbook(buffer: ArrayBuffer, filename: string, params: AnalysisParams,
+  onProgress: (pct: number, message: string) => void = () => {}): PipelineResult {
+  if (!hasExcelSignature(new Uint8Array(buffer.slice(0, 8)))) {
+    throw new AnalysisError('Isi berkas bukan workbook Excel (.xlsx/.xls). Berkas mungkin rusak, atau berupa CSV/PDF/berkas lain yang diganti ekstensinya.');
+  }
+  let wb: XLSX.WorkBook;
+  try {
+    wb = XLSX.read(buffer, { type: 'array' });
+  } catch {
+    throw new AnalysisError('Workbook Excel tidak dapat dibaca: berkas rusak, terenkripsi, atau bukan berkas Excel.');
+  }
+  const refDay = toUtcDay(params.referenceDate);
+  if (refDay === null) throw new AnalysisError('Tanggal acuan harus berformat YYYY-MM-DD.');
 
+  const sheets: SheetResult[] = [];
+  const skipped: { sheetName: string; reason: string }[] = [];
+  let anyData = false;
+  let validSheets = 0;
+  const nSheets = wb.SheetNames.length;
+
+  wb.SheetNames.forEach((sheetName, si) => {
+    const pBase = 5 + (90 * si) / nSheets;
+    const pSpan = 90 / nSheets;
+    onProgress(pBase, `Validasi lembar ${sheetName}...`);
+    const ws = wb.Sheets[sheetName];
+    const rows = XLSX.utils.sheet_to_json<unknown[]>(ws, { header: 1, defval: null, raw: true, blankrows: true });
+    const origin = ws['!ref'] ? XLSX.utils.decode_range(ws['!ref']).s.r : 0;
+    if (rows.length < 2) { skipped.push({ sheetName, reason: 'Lembar kosong' }); return; }
+
+    const h = detectHeaderRow(rows);
+    const seen: Record<string, number> = {};
+    const headers = (rows[h] ?? []).map((cell, i) => {
+      const name = cell === null || cell === undefined || String(cell).trim() === '' ? `Kolom_${i + 1}` : String(cell).trim();
+      seen[name] = (seen[name] ?? 0) + 1;
+      return seen[name] === 1 ? name : `${name}_${seen[name]}`;
+    });
+    const dataRows = rows.slice(h + 1)
+      .map((row, i) => ({ row: row ?? [], excelRow: origin + h + 2 + i }))
+      .filter(({ row }) => row.some(v => v !== null && v !== undefined && String(v).trim() !== ''));
+    if (!dataRows.length) { skipped.push({ sheetName, reason: 'Tidak ada baris data balita' }); return; }
+    anyData = true;
+
+    const roleIdx: Partial<Record<Role, number>> = {};
+    headers.forEach((hd, i) => {
+      const role = columnRole(hd);
+      if (role && role !== 'identifier' && roleIdx[role] === undefined) roleIdx[role] = i;
+    });
+    const required: [Role, string][] = [['gender', 'JK'], ['weight', 'Berat'], ['height', 'Tinggi'], ['haz', 'ZS TB/U'], ['waz', 'ZS BB/U'], ['whz', 'ZS BB/TB']];
+    const missing = required.filter(([r]) => roleIdx[r] === undefined).map(([, l]) => l);
+    if (roleIdx.age === undefined && roleIdx.dob === undefined) missing.push('Usia (bulan) atau Tgl Lahir');
+    if (missing.length) { skipped.push({ sheetName, reason: `Kolom wajib tidak ditemukan: ${missing.join(', ')}` }); return; }
+    validSheets++;
+
+    const useMeasured = roleIdx.age === undefined && roleIdx.measured !== undefined;
+    const ageSource = roleIdx.age !== undefined ? 'kolom usia'
+      : useMeasured ? 'Tgl Lahir terhadap kolom tanggal ukur' : `Tgl Lahir terhadap tanggal acuan ${params.referenceDate}`;
+    const keepIdx = headers.map((_, i) => i).filter(i => columnRole(headers[i]) !== 'identifier');
+    const dateIdx = new Set([roleIdx.dob, roleIdx.measured].filter((i): i is number => i !== undefined));
+    const cell = (row: unknown[], role: Role) => (roleIdx[role] === undefined ? null : row[roleIdx[role]!]);
+    const num = (row: unknown[], role: Role) => parseNumericValue(cell(row, role));
+
+    const excluded: ExcludedRow[] = [];
+    const records: ChildRecord[] = [];
+    const features: number[][] = [];
+    for (const { row, excelRow } of dataRows) {
+      let age: number | null;
+      if (roleIdx.age !== undefined) {
+        age = num(row, 'age');
+      } else {
+        const dob = toUtcDay(cell(row, 'dob'));
+        const ref = (useMeasured ? toUtcDay(cell(row, 'measured')) : null) ?? refDay;
+        age = dob === null ? null : round((ref - dob) / DAYS_PER_MONTH, 2);
+      }
+      const haz = num(row, 'haz'), waz = num(row, 'waz'), whz = num(row, 'whz');
+      const weight = num(row, 'weight'), height = num(row, 'height');
+      const gender = parseGender(cell(row, 'gender'));
+      const issues = rowIssues(haz, waz, whz, weight, height, age, gender);
+      if (issues.length) { excluded.push({ row: excelRow, reasons: issues }); continue; }
+
+      const rec: ChildRecord = { Baris_Excel: excelRow };
+      for (const i of keepIdx) {
+        const v = row[i] ?? null;
+        const day = dateIdx.has(i) ? toUtcDay(v) : null;
+        rec[headers[i]] = day !== null ? dayToIso(day) : v;
+      }
+      const key = permenkesKey(haz!, waz!, whz!);
+      rec.Usia_Bulan_Dihitung = age;
+      rec[RULE_LABEL_FIELD] = PERMENKES_LABELS[key];
+      rec.CURE_Cluster_ID = -1;
+      Object.assign(rec, recommendations(key, age!, haz!, waz!, whz!, height!, weight!, gender,
+        String(cell(row, 'notes') ?? ''), {
+          tbu: String(cell(row, 'status_tbu') ?? ''), bbu: String(cell(row, 'status_bbu') ?? ''), bbtb: String(cell(row, 'status_bbtb') ?? ''),
+        }));
+      records.push(rec);
+      features.push([haz!, waz!, whz!, age! / 60]);
+    }
+
+    let silhouette: number | null = null;
+    if (records.length >= 2) {
+      const k = Math.min(params.k, records.length);
+      const sampled = records.length > params.sampleSize;
+      const sampleIdx = sampled ? seededSample(records.length, params.sampleSize, 42) : null;
+      const fitX = sampleIdx ? sampleIdx.map(i => features[i]) : features;
+      onProgress(pBase + pSpan * 0.1, `CURE lembar ${sheetName}: ${fitX.length} titik sampel, k=${k}...`);
+      const model = cureFit(fitX, k, params.c, params.alpha, (done, total) =>
+        onProgress(pBase + pSpan * (0.1 + 0.8 * (done / total)), `CURE lembar ${sheetName}: penggabungan ${done}/${total}`));
+      const labels = sampled ? curePredict(model, features) : model.labels;
+      labels.forEach((l, i) => { records[i].CURE_Cluster_ID = l; });
+      silhouette = silhouetteScore(model.scaled, model.labels);
+    }
+
+    if (!records.length) {
+      skipped.push({ sheetName, reason: `Semua ${excluded.length} baris dikeluarkan saat validasi (contoh baris ${excluded[0].row}: ${excluded[0].reasons.join('; ')})` });
+      return;
+    }
+    const columns = ['Baris_Excel', ...keepIdx.map(i => headers[i]), 'Usia_Bulan_Dihitung', RULE_LABEL_FIELD, 'CURE_Cluster_ID',
+      'Prioritas_Intervensi', 'Saran_Asupan_Nutrisi', 'Tindakan_Medis_Sanitasi', 'Jadwal_Monitoring'];
+    sheets.push(summarizeSheet({ sheetName, inputRows: dataRows.length, rowCount: records.length, columns, records, excluded, ageSource, silhouette },
+      RULE_LABEL_FIELD, null));
+  });
+
+  if (!anyData) throw new AnalysisError('Tidak ada data balita pada berkas ini.', skipped.map(s => `Lembar ${s.sheetName}: ${s.reason}`));
+  const details = skipped.map(s => `Lembar ${s.sheetName}: ${s.reason}`);
+  if (!validSheets) {
+    throw new AnalysisError('Tidak ada lembar dengan kolom wajib (JK, Berat, Tinggi, ZS TB/U, ZS BB/U, ZS BB/TB, serta Usia atau Tgl Lahir). Data tidak diberi label.', details);
+  }
+  if (!sheets.length) throw new AnalysisError('Tidak ada data balita yang lolos validasi (semua baris tidak lengkap atau tidak wajar).', details);
+  onProgress(100, 'Selesai');
   return {
-    autoLabel: label,
-    confidence,
-    priority,
-    ...recommendations
+    mode: 'client', indobertActive: false, originalFilename: filename,
+    totalRows: sheets.reduce((a, s) => a + s.rowCount, 0), processedSheets: sheets.length,
+    cureParams: params, sheets, skippedSheets: skipped,
+    labelField: RULE_LABEL_FIELD, labelTitle: RULE_LABEL_TITLE, executionTimestamp: new Date().toISOString(),
   };
 }
 
-export function generateInterventionRecommendations(
-  autoLabel: string,
-  ageMonths: number | null,
-  haz: number | null,
-  waz: number | null,
-  whz: number | null,
-  heightCm: number | null,
-  weightKg: number | null,
-  childName: string,
-  gender: 'L' | 'P' | null,
-  notes: string,
-  tbUStatus: string = '',
-  bbUStatus: string = '',
-  bbTbStatus: string = ''
-): {
-  saranNutrisi: string;
-  tindakanMedis: string;
-  jadwalMonitoring: string;
-} {
-  const isSevere = autoLabel.includes('Stunting Berat') || autoLabel.includes('Gizi Buruk') || (haz !== null && haz < -3.0);
-  const isModerate = autoLabel.includes('Stunting Ringan') || autoLabel.includes('Gizi Kurang') || (haz !== null && haz < -2.0 && haz >= -3.0);
-  const isOverweight = autoLabel.includes('Risiko Gizi Lebih');
-  const isUnderweight = (waz !== null && waz < -2.0) || bbUStatus.toLowerCase().includes('kurang');
-  const isWasted = (whz !== null && whz < -2.0) || bbTbStatus.toLowerCase().includes('kurang');
+// ---------------------------------------------------------------------------
+// Mode server: adaptor respons /api/analyze
+// ---------------------------------------------------------------------------
+interface ServerSheet {
+  sheet_name: string; input_rows: number; excluded_rows: ExcludedRow[]; age_source: string;
+  columns: string[]; rows: unknown[][];
+}
+interface ServerSummarySheet {
+  sheet_name: string; silhouette_score: number | null;
+  cluster_semantic_labels: { cluster_id: number; cluster_label: string; confidence: number | null }[];
+}
+export interface ServerResponse {
+  status: string; message?: string; indobert_active: boolean; reference_date: string;
+  summary: { sheets: ServerSummarySheet[] };
+  sheets: ServerSheet[];
+  skipped_sheets: { sheet_name: string; reason: string }[];
+}
 
-  const childGenderStr = gender === 'P' ? 'Perempuan' : gender === 'L' ? 'Laki-laki' : '';
-  const childTag = childName ? `Anak ${childName}` : 'Balita';
-  const ageDisplay = ageMonths !== null ? `${ageMonths} bln` : 'Usia Balita';
-  const headerSummary = `[${childTag} - ${ageDisplay}${childGenderStr ? `, ${childGenderStr}` : ''}]:`;
-
-  // 1. Precise anthropometric status & gap against WHO Median
-  const statusParts: string[] = [];
-  if (haz !== null && ageMonths !== null) {
-    const isBoy = gender !== 'P';
-    const hMed = isBoy
-      ? (ageMonths <= 24 ? 50.0 + 1.85 * ageMonths - 0.035 * ageMonths * ageMonths : 87.8 + 0.65 * (ageMonths - 24))
-      : (ageMonths <= 24 ? 49.0 + 1.80 * ageMonths - 0.035 * ageMonths * ageMonths : 86.5 + 0.63 * (ageMonths - 24));
-    
-    if (heightCm !== null) {
-      const diff = Math.round((hMed - heightCm) * 10) / 10;
-      if (diff > 0) {
-        statusParts.push(`Tinggi ${heightCm} cm (defisit ${diff} cm di bawah median WHO ${Math.round(hMed * 10) / 10} cm, Z-Score TB/U: ${haz.toFixed(2)} SD, Status: ${tbUStatus || 'Pendek'}).`);
-      } else {
-        statusParts.push(`Tinggi ${heightCm} cm (sesuai median WHO seusianya ${Math.round(hMed * 10) / 10} cm, Z-Score TB/U: ${haz.toFixed(2)} SD, Status: ${tbUStatus || 'Normal'}).`);
-      }
-    } else {
-      statusParts.push(`Z-Score TB/U: ${haz.toFixed(2)} SD (${tbUStatus || 'Tercatat'}).`);
-    }
-  } else if (heightCm !== null) {
-    statusParts.push(`Tinggi badan ${heightCm} cm (Status TB/U: ${tbUStatus || '-'}).`);
-  }
-
-  if (waz !== null && ageMonths !== null) {
-    const isBoy = gender !== 'P';
-    const wMed = isBoy
-      ? (ageMonths <= 24 ? 3.3 + 0.52 * ageMonths - 0.005 * ageMonths * ageMonths : 12.2 + 0.18 * (ageMonths - 24))
-      : (ageMonths <= 24 ? 3.2 + 0.49 * ageMonths - 0.005 * ageMonths * ageMonths : 11.5 + 0.17 * (ageMonths - 24));
-    
-    if (weightKg !== null) {
-      const diffW = Math.round((wMed - weightKg) * 10) / 10;
-      if (diffW > 0) {
-        statusParts.push(`Berat ${weightKg} kg (defisit ${diffW} kg dari target median WHO ${Math.round(wMed * 10) / 10} kg, Z-Score BB/U: ${waz.toFixed(2)} SD, Status: ${bbUStatus || 'Kurang'}).`);
-      } else {
-        statusParts.push(`Berat ${weightKg} kg (sesuai target median WHO ${Math.round(wMed * 10) / 10} kg, Z-Score BB/U: ${waz.toFixed(2)} SD, Status: ${bbUStatus || 'Normal'}).`);
-      }
-    }
-  } else if (weightKg !== null) {
-    statusParts.push(`Berat badan ${weightKg} kg (Status BB/U: ${bbUStatus || '-'}).`);
-  }
-
-  if (whz !== null) {
-    statusParts.push(`Z-Score BB/TB: ${whz.toFixed(2)} SD (${bbTbStatus || 'Gizi Baik'}).`);
-  }
-
-  // 2. Specific age-bracket food consistency, portions, and protein menu
-  let ageMenuPlan = '';
-  if (ageMonths !== null) {
-    if (ageMonths < 6) {
-      ageMenuPlan = 'Fase Usia < 6 Bulan: Wajib ASI Eksklusif on-demand minimal 8-12 kali per 24 jam tanpa tambahan air putih atau makanan padat. Ibu menyusui wajib mengonsumsi double protein hewani harian (2 butir telur + 1 porsi ikan kembung/tongkol) dan suplemen kalsium serta tablet tambah darah agar densitas gizi ASI optimal.';
-    } else if (ageMonths >= 6 && ageMonths <= 8) {
-      ageMenuPlan = 'Fase MPASI Awal (6-8 Bulan): Tekstur saring/lumat kental (tidak tumpah saat sendok dimiringkan). Jadwal: 2-3 kali makan utama (mulai 2-3 sdm bertahap hingga 1/2 mangkuk 125ml) + 1-2 selingan padat gizi. Menu harian wajib: 1 butir telur ayam rebus dilumatkan + 1 sdm hati ayam atau ikan kembung suwir saring halus + 1 sendok teh lemak tambahan (minyak kelapa sawit/santan matang/margarin) sebagai pendorong kalori (energy booster).';
-    } else if (ageMonths >= 9 && ageMonths <= 11) {
-      ageMenuPlan = 'Fase MPASI Lanjutan (9-11 Bulan): Tekstur cincang halus atau finger foods lunak yang mudah dijumput anak. Jadwal: 3-4 kali makan utama (1/2 mangkuk 125-150ml) + 1-2 kali selingan padat gizi dan ASI. Komposisi harian: 1 butir telur ayam + 1 potong ikan laut lokal (lele/kembung/patin kaya omega-3 DHA dan asam amino lisin untuk lempeng pertumbuhan tulang panjang) + 1 sdt minyak kelapa matang atau mentega.';
-    } else if (ageMonths >= 12 && ageMonths <= 23) {
-      ageMenuPlan = 'Fase Makanan Keluarga & MPASI Baduta (12-23 Bulan): Makanan keluarga dipotong kecil/lunak, 3-4 kali makan utama (3/4 mangkuk 200ml) + 2 kali selingan padat protein (puding telur, nagasari santan, atau perkedel tahu daging) + ASI hingga 2 tahun. Sasaran harian: Minimal 1-2 butir telur ayam + 30-40 gram daging ayam/ikan lokal/hati sapi.';
-    } else if (ageMonths >= 24 && ageMonths <= 35) {
-      ageMenuPlan = 'Fase Anak Batita (2-3 Tahun): Makanan keluarga menu Isi Piringku 3 kali sehari porsi penuh + 2 selingan buah segar atau kudapan protein hewani. Sasaran harian: 1 butir telur + 1 porsi lauk hewani (ayam, ikan laut, atau daging sapi) + tahu/tempe + sayuran beraneka warna. Hindari jajanan manis kemasan dan minuman berpemanis buatan agar nafsu makan anak tidak turun.';
-    } else {
-      ageMenuPlan = 'Fase Anak Prasekolah (3-5 Tahun): Menu gizi seimbang Isi Piringku 3 kali makan utama + 2 kali selingan sehat. Porsi harian: 1 butir telur + 1 porsi protein hewani berkualitas tinggi + sayuran sumber vitamin A & zat besi + susu pasteurisasi tanpa gula/air putih higienis 6-8 gelas.';
-    }
-  } else {
-    ageMenuPlan = 'Pola Makan Balita: Utamakan makanan padat gizi berbasis protein hewani (telur, ikan laut lokal, daging ayam) 3 kali makan utama sehari ditambah selingan sehat.';
-  }
-
-  // 3. Clinical dietary intervention based on stunting severity and wasting status
-  let targetedDiet = '';
-  if (isSevere) {
-    targetedDiet = 'Intervensi Pemulihan Stunting Kronis / Berat: Wajib konsumsi Double Protein Hewani harian (misal: telur ayam di pagi hari + ikan kembung/hati ayam di siang dan sore). Tambahkan ekstra 1-2 sdt minyak kelapa matang/santan kental pada setiap mangkuk makan anak untuk mengejar ketertinggalan kalori. Konsultasikan ke dokter untuk peresepan Pangan Olahan untuk Keperluan Medis Khusus (PKMK) tinggi kalori (1.0-1.5 kkal/ml) serta tabur gizi mikro (Taburia/zinc).';
-  } else if (isModerate) {
-    targetedDiet = 'Intervensi Stunting Sedang / Kejar Tumbuh: Berikan Pemberian Makanan Tambahan (PMT) Pemulihan berbasis bahan pangan lokal selama 90 hari berturut-turut. Setiap menu makan wajib menyertakan minimal 1 butir telur dan sumber zat besi heme (hati ayam/daging) 2 kali seminggu untuk mencegah anemia defisiensi besi yang menghambat sekresi hormon pertumbuhan (GH/IGF-1).';
-  } else if (isWasted || isUnderweight) {
-    targetedDiet = 'Intervensi Berat Badan Kurang (Underweight/Wasted): Fokus utama menaikkan berat badan (weight faltering) dengan memperbanyak densitas kalori MPASI (menambahkan santan matang, mentega, atau alpukat) serta porsi selingan protein tinggi sebelum mengejar tinggi badan.';
-  } else if (isOverweight) {
-    targetedDiet = 'Intervensi Gizi Lebih / Overweight: Pertahankan lauk protein hewani esensial (telur rebus, ikan kukus tanpa tepung), gantikan camilan manis/biskuit olahan dengan buah potong segar (pepaya, pisang, melon) dan sayuran berserat. Dorong aktivitas fisik aktif bermain minimal 60 menit sehari.';
-  } else {
-    targetedDiet = 'Pemeliharaan Gizi Optimal: Pertahankan kecukupan protein hewani setiap hari (1 telur sehari), sayuran beraneka warna, dan air minum matang. Lanjutkan pola makan teratur untuk menjaga kurva pertumbuhan tetap berada di jalur hijau KMS.';
-  }
-
-  const finalDietAdvice = `${headerSummary} ${statusParts.join(' ')} ${ageMenuPlan} ${targetedDiet}`.trim();
-
-  // 4. Personalized Medical, Clinical Notes & Sanitation Actions
-  const actions: string[] = [];
-  const notesLower = notes.toLowerCase();
-
-  if (notesLower.includes('diare') || notesLower.includes('mencret') || notesLower.includes('cair')) {
-    actions.push('Tatalaksana Diare Akut: Berikan tablet Zinc dispersible selama 10 hari penuh tanpa putus (10 mg untuk usia <6 bulan, 20 mg untuk usia >=6 bulan) + Larutan Oralit setiap kali BAB cair untuk mempercepat regenerasi mikrovili usus.');
-  }
-
-  if (notesLower.includes('batuk') || notesLower.includes('tb') || notesLower.includes('flek') || notesLower.includes('paru')) {
-    actions.push('Skrining Infeksi Tuberkulosis (TB): Segera jadwalkan Uji Mantoux (Tuberkulin) atau Skoring TB Anak di Puskesmas untuk mendeteksi infeksi TB laten/aktif sebagai penyebab primer gagal tumbuh pada balita.');
-  }
-
-  if (isSevere) {
-    actions.push('Rujukan Medis Faskes Tingkat Lanjut: Rujuk anak ke Puskesmas/Dokter Spesialis Anak (Sp.A) untuk evaluasi "Red Flags" gagal tumbuh, pemeriksaan kadar hemoglobin (skrining anemia defisiensi besi), dan peresepan terapi nutrisi medis PKMK.');
-  } else if (isModerate || isUnderweight || isWasted) {
-    actions.push('Konseling Gizi Puskesmas: Dampingi ibu balita ke Poli Gizi Puskesmas untuk evaluasi praktik Pemberian Makanan Bayi dan Anak (PMBA) serta verifikasi kepatuhan konsumsi paket PMT lokal.');
-  }
-
-  if (ageMonths !== null && ageMonths >= 12) {
-    actions.push('Pencegahan Kecacingan: Berikan obat cacing Albendazole 400 mg (atau Pirantel Pamoat) rutin setiap 6 bulan sekali di Posyandu.');
-  }
-
-  actions.push('Sanitasi Lingkungan & CTPS: Biasakan Cuci Tangan Pakai Sabun (CTPS) pada 5 waktu kritis (sebelum makan, sebelum menyuapi anak, sebelum mengolah MPASI, setelah BAB/cebok, dan setelah memegang hewan). Pastikan air minum keluarga dimasak hingga mendidih 100°C.');
-
-  const finalMedicalAction = actions.join(' ');
-
-  // 5. Monitoring Schedule
-  let schedule = '';
-  if (isSevere) {
-    schedule = 'Pemantauan Mingguan: Penimbangan berat badan dan evaluasi asupan gizi setiap 1 minggu sekali di Faskes/Puskesmas rujukan.';
-  } else if (isModerate || isUnderweight || isWasted) {
-    schedule = 'Pemantauan Dua Mingguan: Penimbangan BB dan pengukuran PB/TB setiap 2 minggu sekali di Posyandu atau Pos Gizi Puskesmas.';
-  } else {
-    schedule = 'Pemantauan Rutin Bulanan: Penimbangan BB dan pengukuran PB/TB setiap 1 bulan sekali pada Hari Buka Posyandu.';
-  }
-
+export function fromServerResponse(body: ServerResponse, filename: string, params: AnalysisParams): PipelineResult {
+  const labelField = body.indobert_active ? MODEL_LABEL_FIELD : RULE_LABEL_FIELD;
+  const sheets = body.sheets.map(s => {
+    const dateCols = new Set(s.columns.filter(c => ['dob', 'measured'].includes(columnRole(c) ?? '')));
+    const records = s.rows.map(row => {
+      const rec: ChildRecord = {};
+      s.columns.forEach((c, i) => {
+        const v = row[i];
+        rec[c] = dateCols.has(c) && typeof v === 'string' ? v.slice(0, 10) : v;
+      });
+      return rec;
+    });
+    const summ = body.summary.sheets.find(x => x.sheet_name === s.sheet_name);
+    return summarizeSheet({
+      sheetName: s.sheet_name, inputRows: s.input_rows, rowCount: records.length, columns: s.columns, records,
+      excluded: s.excluded_rows, ageSource: s.age_source, silhouette: summ?.silhouette_score ?? null,
+    }, labelField, body.indobert_active ? summ?.cluster_semantic_labels ?? null : null);
+  });
   return {
-    saranNutrisi: finalDietAdvice,
-    tindakanMedis: finalMedicalAction,
-    jadwalMonitoring: schedule
+    mode: 'server', indobertActive: body.indobert_active, originalFilename: filename,
+    totalRows: sheets.reduce((a, s) => a + s.rowCount, 0), processedSheets: sheets.length,
+    cureParams: { ...params, referenceDate: body.reference_date }, sheets,
+    skippedSheets: body.skipped_sheets.map(s => ({ sheetName: s.sheet_name, reason: s.reason })),
+    labelField, labelTitle: body.indobert_active ? 'Prediksi IndoBERT-RCNN (per anak)' : RULE_LABEL_TITLE,
+    executionTimestamp: new Date().toISOString(),
   };
 }
 
-// Process raw workbook file
-export async function processWorkbook(
-  workbook: XLSX.WorkBook,
-  filename: string,
-  cureParams: { k: number; c: number; alpha: number }
-): Promise<PipelineResult> {
-  const result: PipelineResult = {
-    originalFilename: filename,
-    totalRows: 0,
-    processedSheets: 0,
-    cureParams,
-    sheets: [],
-    globalClusterDistribution: {},
-    globalLabelDistribution: {},
-    globalCrosstab: {},
-    globalPurityScore: 0,
-    executionTimestamp: new Date().toISOString()
-  };
-
-  const cure = new CUREAlgorithm(cureParams.k, cureParams.c, cureParams.alpha);
-
-  for (const sheetName of workbook.SheetNames) {
-    const ws = workbook.Sheets[sheetName];
-    const { rawData, detectedHeaders } = extractDataFromWorksheet(ws);
-    if (!rawData || rawData.length === 0) continue;
-
-    result.processedSheets++;
-    result.totalRows += rawData.length;
-
-    // 1. Extract anthropometric indicators for each child individually
-    const indicatorsList = rawData.map(row => extractChildIndicators(row, sheetName));
-
-    // 2. Construct 4-dimensional bounded feature matrix for CURE clustering
-    // Research methodology: Only complete anthropometric records are clustered with CURE.
-    // Incomplete records are not arbitrarily imputed.
-    const validCureIndices: number[] = [];
-    const featureMatrix: number[][] = [];
-
-    indicatorsList.forEach((ind, idx) => {
-      if (ind.haz !== null && ind.waz !== null && ind.whz !== null && ind.ageMonths !== null) {
-        validCureIndices.push(idx);
-        featureMatrix.push([
-          ind.haz,
-          ind.waz,
-          ind.whz,
-          Math.min(72, ind.ageMonths) / 60
-        ]);
-      }
-    });
-
-    const labels: number[] = new Array(rawData.length).fill(-1);
-    if (featureMatrix.length >= 2) {
-      const { labels: fitted } = cure.fitPredict(featureMatrix);
-      validCureIndices.forEach((origIdx, fIdx) => {
-        labels[origIdx] = fitted[fIdx] ?? 0;
-      });
-    }
-
-    // Compute cluster anthropometric averages
-    const clusterHazSums: Record<number, number[]> = {};
-    const clusterWazSums: Record<number, number[]> = {};
-    const clusterWhzSums: Record<number, number[]> = {};
-    for (let i = 0; i < rawData.length; i++) {
-      const cid = labels[i];
-      if (cid < 0) continue;
-      if (!clusterHazSums[cid]) clusterHazSums[cid] = [];
-      if (!clusterWazSums[cid]) clusterWazSums[cid] = [];
-      if (!clusterWhzSums[cid]) clusterWhzSums[cid] = [];
-      const { haz, waz, whz } = indicatorsList[i];
-      if (haz !== null) clusterHazSums[cid].push(haz);
-      if (waz !== null) clusterWazSums[cid].push(waz);
-      if (whz !== null) clusterWhzSums[cid].push(whz);
-    }
-
-    const kemenkes7Names: Record<number, string> = {
-      0: 'Klaster 0 (Stunting Berat Komorbid)',
-      1: 'Klaster 1 (Stunting Kronis / Sangat Pendek)',
-      2: 'Klaster 2 (Stunting Sedang / Pendek)',
-      3: 'Klaster 3 (Gizi Buruk Akut / Wasting Berat)',
-      4: 'Klaster 4 (Gizi Kurang / Risiko Gagal Tumbuh)',
-      5: 'Klaster 5 (Pertumbuhan Normal Optimal)',
-      6: 'Klaster 6 (Risiko Gizi Lebih / Overweight)'
-    };
-
-    const stunting4Names: Record<number, string> = {
-      0: 'Klaster 0 (Stunting Berat / Malnutrisi Kronis)',
-      1: 'Klaster 1 (Stunting Sedang / Risiko Underweight)',
-      2: 'Klaster 2 (Pertumbuhan Normal Optimal)',
-      3: 'Klaster 3 (Pertumbuhan Tinggi / Risiko Lebih)'
-    };
-
-    const clusterNameMap: Record<number, string> = {};
-    for (let cid = 0; cid < cureParams.k; cid++) {
-      if (cureParams.k === 7 && kemenkes7Names[cid]) {
-        clusterNameMap[cid] = kemenkes7Names[cid];
-      } else if (cureParams.k === 4 && stunting4Names[cid]) {
-        clusterNameMap[cid] = stunting4Names[cid];
-      } else {
-        const hazs = clusterHazSums[cid] || [];
-        const wazs = clusterWazSums[cid] || [];
-        const whzs = clusterWhzSums[cid] || [];
-        const avgHaz = hazs.length > 0 ? hazs.reduce((a, b) => a + b, 0) / hazs.length : 0;
-        const avgWaz = wazs.length > 0 ? wazs.reduce((a, b) => a + b, 0) / wazs.length : 0;
-        const avgWhz = whzs.length > 0 ? whzs.reduce((a, b) => a + b, 0) / whzs.length : 0;
-
-        if (avgHaz < -3.0 || (avgHaz < -2.0 && avgWaz < -2.0)) {
-          clusterNameMap[cid] = `Klaster ${cid} (Stunting Berat Komorbid)`;
-        } else if (avgHaz < -2.0) {
-          clusterNameMap[cid] = `Klaster ${cid} (Stunting Sedang / Pendek)`;
-        } else if (avgWhz < -2.5) {
-          clusterNameMap[cid] = `Klaster ${cid} (Gizi Buruk Akut / Wasting)`;
-        } else if (avgWaz < -2.0 || avgWhz < -2.0) {
-          clusterNameMap[cid] = `Klaster ${cid} (Gizi Kurang / Risiko Underweight)`;
-        } else if (avgHaz > 1.5 || avgWhz > 1.5) {
-          clusterNameMap[cid] = `Klaster ${cid} (Pertumbuhan Tinggi / Overweight)`;
-        } else {
-          clusterNameMap[cid] = `Klaster ${cid} (Pertumbuhan Normal Optimal)`;
-        }
-      }
-    }
-
-    const sheetClusterDist: Record<string, number> = {};
-    const sheetLabelDist: Record<string, number> = {};
-
-    const enrichedRecords: ChildRecord[] = rawData.map((row, idx) => {
-      const cid = labels[idx] ?? 0;
-      const clusterName = clusterNameMap[cid] || `Klaster ${cid}`;
-      const indicators = indicatorsList[idx];
-      const classification = predictChildClassification(indicators);
-
-      const clusterKey = `Klaster ${cid}`;
-      sheetClusterDist[clusterKey] = (sheetClusterDist[clusterKey] || 0) + 1;
-      sheetLabelDist[classification.autoLabel] = (sheetLabelDist[classification.autoLabel] || 0) + 1;
-
-      result.globalClusterDistribution[clusterKey] = (result.globalClusterDistribution[clusterKey] || 0) + 1;
-      result.globalLabelDistribution[classification.autoLabel] = (result.globalLabelDistribution[classification.autoLabel] || 0) + 1;
-
-      return {
-        ...row,
-        Cluster_ID: cid,
-        Cluster_Name: clusterName,
-        CURE_Cluster_ID: cid,
-        CURE_Cluster_Label: clusterName,
-        Auto_Label: classification.autoLabel,
-        Label_Confidence: classification.confidence,
-        Clinical_Priority: classification.priority,
-        Saran_Asupan_Nutrisi: classification.saranNutrisi,
-        Tindakan_Medis_Sanitasi: classification.tindakanMedis,
-        Jadwal_Monitoring: classification.jadwalMonitoring,
-        Calculated_HAZ: indicators.haz,
-        Calculated_WAZ: indicators.waz,
-        Calculated_WHZ: indicators.whz,
-        Usia_Bulan: indicators.ageMonths
-      };
-    });
-
-    // Compute cluster profile metrics
-    const clusterProfiles = [];
-    for (let cid = 0; cid < cureParams.k; cid++) {
-      const members = enrichedRecords.filter(r => r.Cluster_ID === cid);
-      if (members.length === 0) continue;
-
-      const hazs = members.map(m => m.Calculated_HAZ).filter((h): h is number => h !== null && h !== undefined);
-      const wazs = members.map(m => m.Calculated_WAZ).filter((w): w is number => w !== null && w !== undefined);
-      const whzs = members.map(m => m.Calculated_WHZ).filter((wh): wh is number => wh !== null && wh !== undefined);
-      const ages = members.map(m => m.Usia_Bulan).filter((a): a is number => a !== null && a !== undefined);
-
-      const hazMean = hazs.length > 0 ? hazs.reduce((a, b) => a + b, 0) / hazs.length : undefined;
-      const wazMean = wazs.length > 0 ? wazs.reduce((a, b) => a + b, 0) / wazs.length : undefined;
-      const whzMean = whzs.length > 0 ? whzs.reduce((a, b) => a + b, 0) / whzs.length : undefined;
-      const ageMean = ages.length > 0 ? ages.reduce((a, b) => a + b, 0) / ages.length : undefined;
-
-      clusterProfiles.push({
-        clusterId: cid,
-        clusterName: clusterNameMap[cid] || `Klaster ${cid}`,
-        count: members.length,
-        percentage: Math.round((members.length / enrichedRecords.length) * 1000) / 10,
-        hazMean: hazMean !== undefined ? Math.round(hazMean * 100) / 100 : undefined,
-        wazMean: wazMean !== undefined ? Math.round(wazMean * 100) / 100 : undefined,
-        whzMean: whzMean !== undefined ? Math.round(whzMean * 100) / 100 : undefined,
-        ageMean: ageMean !== undefined ? Math.round(ageMean * 10) / 10 : undefined
-      });
-    }
-
-    const allCols = detectedHeaders.length > 0 ? detectedHeaders : Object.keys(rawData[0]);
-    const finalCols = [
-      'Cluster_ID',
-      'Cluster_Name',
-      'Auto_Label',
-      'Clinical_Priority',
-      'Saran_Asupan_Nutrisi',
-      'Tindakan_Medis_Sanitasi',
-      'Jadwal_Monitoring',
-      'Label_Confidence',
-      ...allCols.filter(col => ![
-        'Cluster_ID', 'Cluster_Name', 'Auto_Label', 'Clinical_Priority',
-        'Saran_Asupan_Nutrisi', 'Tindakan_Medis_Sanitasi', 'Jadwal_Monitoring', 'Label_Confidence'
-      ].includes(col))
-    ];
-
-    // Compute sheet crosstab CURE vs Kemenkes & Purity Score
-    const sheetCrosstab: Record<string, Record<string, number>> = {};
-    for (const r of enrichedRecords) {
-      const cKey = r.Cluster_Name || `Klaster ${r.Cluster_ID}`;
-      const kKey = r.Auto_Label ? r.Auto_Label.split('(')[0].trim() : 'Tidak Diketahui';
-      if (!sheetCrosstab[cKey]) sheetCrosstab[cKey] = {};
-      sheetCrosstab[cKey][kKey] = (sheetCrosstab[cKey][kKey] || 0) + 1;
-
-      if (!result.globalCrosstab[cKey]) result.globalCrosstab[cKey] = {};
-      result.globalCrosstab[cKey][kKey] = (result.globalCrosstab[cKey][kKey] || 0) + 1;
-    }
-
-    let sheetMaxMatches = 0;
-    for (const cKey in sheetCrosstab) {
-      const counts = Object.values(sheetCrosstab[cKey]);
-      sheetMaxMatches += Math.max(...counts);
-    }
-    const sheetPurity = enrichedRecords.length > 0 ? Math.round((sheetMaxMatches / enrichedRecords.length) * 10000) / 100 : 0;
-
-    result.sheets.push({
-      sheetName,
-      rowCount: enrichedRecords.length,
-      columns: finalCols,
-      featuresUsed: ['ZScore_TB_U (HAZ)', 'ZScore_BB_U (WAZ)', 'ZScore_BB_TB (WHZ)', 'Usia_Bulan'],
-      records: enrichedRecords,
-      clusterDistribution: sheetClusterDist,
-      labelDistribution: sheetLabelDist,
-      clusterProfiles,
-      crosstab: sheetCrosstab,
-      purityScore: sheetPurity
-    });
+// ---------------------------------------------------------------------------
+// Interpretasi dihitung dari angka hasil (bukan teks statis)
+// ---------------------------------------------------------------------------
+export function interpretSheet(sheet: SheetResult, result: PipelineResult): string[] {
+  const out: string[] = [];
+  const p = result.cureParams;
+  const clustered = sheet.clusterProfiles.reduce((a, c) => a + c.count, 0);
+  if (sheet.purityScore !== null) {
+    const level = sheet.purityScore >= 80 ? 'tinggi' : sheet.purityScore >= 60 ? 'sedang' : 'rendah';
+    out.push(`Purity klaster CURE terhadap ${RULE_LABEL_TITLE} = ${sheet.purityScore.toFixed(2)}%: ` +
+      `${Math.round((sheet.purityScore / 100) * clustered).toLocaleString('id-ID')} dari ${clustered.toLocaleString('id-ID')} balita ` +
+      `berada pada kategori mayoritas klasternya (keselarasan ${level}). Kategori acuan berasal dari ambang z-score, ` +
+      `sehingga purity bukan akurasi model.`);
   }
-
-  // Compute global purity score
-  let globalMaxMatches = 0;
-  for (const cKey in result.globalCrosstab) {
-    const counts = Object.values(result.globalCrosstab[cKey]);
-    globalMaxMatches += Math.max(...counts);
+  const sorted = [...sheet.clusterProfiles].sort((a, b) => b.count - a.count);
+  if (sorted.length) {
+    const big = sorted[0], small = sorted[sorted.length - 1];
+    out.push(`CURE (k=${p.k}, c=${p.c}, α=${p.alpha.toFixed(2)}) membentuk ${sorted.length} klaster; terbesar Klaster ${big.clusterId} ` +
+      `(${big.count.toLocaleString('id-ID')} anak, ${big.percentage}%), terkecil Klaster ${small.clusterId} ` +
+      `(${small.count.toLocaleString('id-ID')} anak, ${small.percentage}%).`);
   }
-  result.globalPurityScore = result.totalRows > 0 ? Math.round((globalMaxMatches / result.totalRows) * 10000) / 100 : 0;
-
-  return result;
+  for (const c of sheet.clusterProfiles) {
+    out.push(`Klaster ${c.clusterId}: ${c.majorityShare}% anggota berkategori ${shortLabel(c.majorityCategory)}; rerata HAZ ${c.hazMean ?? '-'}, ` +
+      `WAZ ${c.wazMean ?? '-'}, WHZ ${c.whzMean ?? '-'}, usia ${c.ageMean ?? '-'} bulan.` +
+      (c.semanticLabel ? ` Label konsensus IndoBERT-RCNN: ${c.semanticLabel}${c.semanticConfidence !== null && c.semanticConfidence !== undefined ? ` (${c.semanticConfidence})` : ''}.` : ''));
+  }
+  if (sheet.silhouette !== null) {
+    const s = sheet.silhouette;
+    const q = s > 0.5 ? 'struktur klaster kuat' : s > 0.25 ? 'struktur klaster lemah-sedang' : 'struktur klaster lemah/tumpang tindih';
+    out.push(`Silhouette (ruang fitur terstandar, sampel CURE) = ${s.toFixed(4)}: ${q}.`);
+  }
+  if (sheet.excluded.length) {
+    out.push(`${sheet.excluded.length.toLocaleString('id-ID')} dari ${sheet.inputRows.toLocaleString('id-ID')} baris dikeluarkan sebelum analisis ` +
+      `(data tidak lengkap, WHO flag, atau ukuran tidak wajar). Usia dihitung dari ${sheet.ageSource}.`);
+  }
+  if (result.mode === 'client' && sheet.inputRows > p.sampleSize) {
+    out.push(`Mode browser: tahap hierarkis CURE memakai sampel acak ${p.sampleSize} titik (seed 42); hasil dapat berbeda dari server yang memakai RNG numpy.`);
+  }
+  return out;
 }
 
-// Generate benchmark dataset for instant testing
-export function createBenchmarkWorkbook(): XLSX.WorkBook {
-  const namesMale = ['Muhammad Rizky', 'Ahmad Farhan', 'Alif Pratama', 'Bintang Ramadhan', 'Dimas Anggara', 'Rafa Aditya', 'Kenzo Putra', 'Gilang Mahendra', 'Zayan Al-Fatih', 'Haikal Hakim'];
-  const namesFemale = ['Aisyah Putri', 'Nabila Zahra', 'Siti Nurhaliza', 'Keysha Azzahra', 'Aqila Humaira', 'Adiba Shakila', 'Zahra Amelia', 'Tiara Andini', 'Cinta Clarissa', 'Salma Salsabila'];
-
-  const notesTemplates = [
-    'Pertumbuhan sesuai kurva KMS hijau, ASI eksklusif 6 bulan, imunisasi dasar lengkap, anak sangat aktif bermain.',
-    'Nafsu makan berkurang 2 minggu terakhir, KMS berada di pita kuning, asupan protein hewani rendah.',
-    'Balita sangat kurus, riwayat batuk flek 1 bulan, KMS merah (BGM), nafsu makan turun drastis, sanitasi lingkungan kurang.',
-    'Pertumbuhan tinggi badan optimal, berat badan sesuai usia, konsumsi telur dan ikan rutin setiap hari.',
-    'Riwayat diare berulang 3 kali dalam 2 bulan terakhir, malas makan nasi, asupan air minum belum dimasak mendidih.',
-    'Tinggi badan jauh di bawah standar usia sebaya, ibu melaporkan anak pilih-pilih makan (picky eater), KMS kuning.'
-  ];
-
-  const sheet1Data = [];
-  for (let i = 0; i < 30; i++) {
-    const isMale = i % 2 === 0;
-    const nameList = isMale ? namesMale : namesFemale;
-    const name = nameList[i % nameList.length] + ` ${i + 1}`;
-    const age = 6 + (i * 3) % 54;
-    
-    let haz: number;
-    let waz: number;
-    let whz: number;
-
-    if (i % 4 === 0) {
-      haz = -3.4 + (i % 3) * 0.2;
-      waz = -2.6 + (i % 3) * 0.2;
-      whz = -1.8;
-    } else if (i % 4 === 1) {
-      haz = -2.3 + (i % 3) * 0.2;
-      waz = -1.8 + (i % 3) * 0.2;
-      whz = -1.1;
-    } else if (i % 4 === 2) {
-      haz = -0.5 + (i % 3) * 0.3;
-      waz = -0.2 + (i % 3) * 0.2;
-      whz = 0.1;
-    } else {
-      haz = 1.2 + (i % 2) * 0.4;
-      waz = 0.8 + (i % 2) * 0.3;
-      whz = 0.5;
-    }
-
-    const tb = Math.round((50.0 + (age * 0.85) + (haz * 3.2)) * 10) / 10;
-    const bb = Math.round((3.5 + (age * 0.28) + (waz * 1.2)) * 10) / 10;
-
-    sheet1Data.push({
-      No: i + 1,
-      Nama_Anak: name,
-      JK: isMale ? 'L' : 'P',
-      Usia_Bulan: age,
-      Berat_Kg: bb,
-      Tinggi_Cm: tb,
-      HAZ: Math.round(haz * 100) / 100,
-      WAZ: Math.round(waz * 100) / 100,
-      WHZ: Math.round(whz * 100) / 100,
-      Kecamatan: 'Medan Belawan',
-      Catatan_Klinis: notesTemplates[i % notesTemplates.length]
-    });
-  }
-
-  const sheet2Data = [];
-  for (let i = 0; i < 20; i++) {
-    const isMale = i % 2 !== 0;
-    const nameList = isMale ? namesMale : namesFemale;
-    const name = nameList[i % nameList.length] + ` M-${i + 1}`;
-    const age = 8 + (i * 2) % 48;
-    
-    let haz: number;
-    let waz: number;
-    let whz: number;
-
-    if (i % 3 === 0) {
-      haz = -3.2 + (i % 2) * 0.3;
-      waz = -2.8 + (i % 2) * 0.2;
-      whz = -1.6;
-    } else if (i % 3 === 1) {
-      haz = -2.4 + (i % 2) * 0.3;
-      waz = -1.9 + (i % 2) * 0.2;
-      whz = -1.2;
-    } else {
-      haz = 0.8 + (i % 2) * 0.4;
-      waz = 0.5 + (i % 2) * 0.3;
-      whz = 0.3;
-    }
-
-    const tb = Math.round((52.0 + (age * 0.88) + (haz * 3.0)) * 10) / 10;
-    const bb = Math.round((4.0 + (age * 0.25) + (waz * 1.3)) * 10) / 10;
-
-    sheet2Data.push({
-      No: i + 1,
-      Nama_Anak: name,
-      JK: isMale ? 'L' : 'P',
-      Usia_Bulan: age,
-      Berat_Kg: bb,
-      Tinggi_Cm: tb,
-      HAZ: Math.round(haz * 100) / 100,
-      WAZ: Math.round(waz * 100) / 100,
-      WHZ: Math.round(whz * 100) / 100,
-      Posyandu: 'Posyandu Melati 03',
-      Catatan_Klinis: notesTemplates[i % notesTemplates.length]
-    });
-  }
-
-  const wb = XLSX.utils.book_new();
-  const ws1 = XLSX.utils.json_to_sheet(sheet1Data);
-  const ws2 = XLSX.utils.json_to_sheet(sheet2Data);
-
-  XLSX.utils.book_append_sheet(wb, ws1, '2024');
-  XLSX.utils.book_append_sheet(wb, ws2, '2025');
-
-  return wb;
-}
-
-// Export pipeline result to formatted Excel workbook
+// ---------------------------------------------------------------------------
+// Ekspor Excel (terkompresi, tanggal sebagai tanggal Excel)
+// ---------------------------------------------------------------------------
 export function exportResultToExcel(result: PipelineResult): ArrayBuffer {
   const wb = XLSX.utils.book_new();
-
-  // Summary Dashboard Sheet
-  const summaryData = [
-    { Metric: 'Sistem Analisis', Value: 'CURE-IndoBERT for Stunting Analytics' },
-    { Metric: 'Waktu Analisis', Value: result.executionTimestamp },
-    { Metric: 'Berkas Sumber', Value: result.originalFilename },
-    { Metric: 'Total Data Balita', Value: result.totalRows },
-    { Metric: 'Jumlah Lembar / Faskes', Value: result.processedSheets },
-    { Metric: 'Jumlah Klaster (k)', Value: result.cureParams.k },
-    { Metric: 'Titik Perwakilan (c)', Value: result.cureParams.c },
-    { Metric: 'Faktor Penyusutan (alpha)', Value: result.cureParams.alpha }
+  const p = result.cureParams;
+  const summary: [string, string | number][] = [
+    ['Sistem Analisis', 'CURE-IndoBERT for Stunting Analytics'],
+    ['Mode', result.mode === 'server'
+      ? (result.indobertActive ? 'Server: CURE + model IndoBERT-RCNN' : 'Server: CURE (checkpoint IndoBERT belum tersedia)')
+      : 'Browser tanpa model: CURE + kategori Permenkes (aturan ambang)'],
+    ['Label per anak', result.labelTitle],
+    ['Waktu Analisis', result.executionTimestamp],
+    ['Berkas Sumber', result.originalFilename],
+    ['Total Data Balita Dianalisis', result.totalRows],
+    ['Jumlah Klaster (k)', p.k],
+    ['Titik Perwakilan (c)', p.c],
+    ['Faktor Penyusutan (alpha)', p.alpha],
+    ['Ukuran Sampel CURE', p.sampleSize],
+    ['Tanggal Acuan Usia', p.referenceDate],
+    ...result.sheets.flatMap(s => [
+      [`[${s.sheetName}] Baris dianalisis / dikeluarkan`, `${s.rowCount} / ${s.excluded.length}`],
+      [`[${s.sheetName}] Purity vs ${RULE_LABEL_TITLE} (%)`, s.purityScore ?? '-'],
+      [`[${s.sheetName}] Silhouette`, s.silhouette ?? '-'],
+    ] as [string, string | number][]),
   ];
-  const summaryWs = XLSX.utils.json_to_sheet(summaryData);
-  XLSX.utils.book_append_sheet(wb, summaryWs, 'Ringkasan_Eksekutif');
+  XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet([['Metrik', 'Nilai'], ...summary]), 'Ringkasan');
 
-  // Enriched Data Sheets
+  const used = new Set(['Ringkasan']);
   for (const sheet of result.sheets) {
-    const ws = XLSX.utils.json_to_sheet(sheet.records);
-    XLSX.utils.book_append_sheet(wb, ws, sheet.sheetName.slice(0, 31));
+    const dateCols = sheet.columns.filter(c => ['dob', 'measured'].includes(columnRole(c) ?? ''));
+    const rows = sheet.records.map(r => {
+      const o: ChildRecord = {};
+      for (const c of sheet.columns) {
+        const v = r[c];
+        const m = dateCols.includes(c) && typeof v === 'string' ? v.match(/^(\d{4})-(\d{2})-(\d{2})$/) : null;
+        o[c] = m ? new Date(+m[1], +m[2] - 1, +m[3]) : v;
+      }
+      return o;
+    });
+    let name = sheet.sheetName.slice(0, 31);
+    while (used.has(name)) name = `${name.slice(0, 28)}_${used.size}`;
+    used.add(name);
+    XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(rows, { header: sheet.columns, cellDates: true, dateNF: 'yyyy-mm-dd' }), name);
   }
+  const excludedRows = result.sheets.flatMap(s => s.excluded.map(e => ({ Lembar: s.sheetName, Baris_Excel: e.row, Alasan: e.reasons.join('; ') })));
+  if (excludedRows.length) XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(excludedRows), 'Baris_Dikeluarkan');
 
-  const wbout = XLSX.write(wb, { bookType: 'xlsx', type: 'array' });
-  return wbout as ArrayBuffer;
+  return XLSX.write(wb, { bookType: 'xlsx', type: 'array', compression: true }) as ArrayBuffer;
+}
+
+// Data contoh sintetis untuk uji perangkat lunak (bukan data klinis riil)
+export function createBenchmarkWorkbook(): XLSX.WorkBook {
+  const notesTemplates = [
+    'Pertumbuhan sesuai kurva KMS hijau, ASI eksklusif 6 bulan, imunisasi dasar lengkap.',
+    'Nafsu makan berkurang 2 minggu terakhir, KMS berada di pita kuning.',
+    'Balita kurus, riwayat batuk 1 bulan, nafsu makan turun, sanitasi lingkungan kurang.',
+    'Pertumbuhan tinggi badan optimal, konsumsi telur dan ikan rutin setiap hari.',
+    'Riwayat diare berulang 3 kali dalam 2 bulan terakhir.',
+    'Tinggi badan di bawah standar usia sebaya, anak pilih-pilih makan.',
+  ];
+  const make = (n: number, sheet: 1 | 2) => Array.from({ length: n }, (_, i) => {
+    const age = sheet === 1 ? 6 + (i * 3) % 54 : 8 + (i * 2) % 48;
+    const g = sheet === 1 ? i % 4 : [0, 1, 2][i % 3];
+    const [haz, waz, whz] = g === 0 ? [-3.4 + (i % 3) * 0.2, -2.6 + (i % 3) * 0.2, -1.8]
+      : g === 1 ? [-2.3 + (i % 3) * 0.2, -1.8 + (i % 3) * 0.2, -1.1]
+        : g === 2 ? [-0.5 + (i % 3) * 0.3, -0.2 + (i % 3) * 0.2, 0.1]
+          : [1.2 + (i % 2) * 0.4, 0.8 + (i % 2) * 0.3, 0.5];
+    return {
+      No: i + 1,
+      Nama_Anak: `Anak Contoh ${sheet}-${i + 1}`,
+      JK: (i + sheet) % 2 === 1 ? 'L' : 'P',
+      Usia_Bulan: age,
+      Berat_Kg: round(3.5 + age * 0.28 + waz * 1.2, 1),
+      Tinggi_Cm: round(50 + age * 0.85 + haz * 3.2, 1),
+      HAZ: round(haz, 2),
+      WAZ: round(waz, 2),
+      WHZ: round(whz, 2),
+      Posyandu: sheet === 1 ? 'Posyandu Contoh A' : 'Posyandu Contoh B',
+      Catatan_Klinis: notesTemplates[i % notesTemplates.length],
+    };
+  });
+  const wb = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(make(30, 1)), '2024');
+  XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(make(20, 2)), '2025');
+  return wb;
 }
